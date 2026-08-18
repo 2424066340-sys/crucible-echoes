@@ -6,6 +6,192 @@
 
 项目不包含任何第三方游戏的美术、文本、代码或品牌素材。全部名称、说明与实现均为本项目原创内容。项目采用 MIT License，详见 [LICENSE](https://github.com/2424066340-sys/crucible-echoes/blob/main/LICENSE)。
 
+
+# 怎么让你的 AI 玩《坩埚余响》
+
+《坩埚余响》已经提供专门的 **AI Agent 接口**。如果你的 AI 能执行终端命令，就可以让它自己开局、读取游戏状态、做决定并一直玩到结束。
+
+## 1. 先下载游戏
+
+打开项目地址：
+
+https://github.com/2424066340-sys/crucible-echoes
+
+点击：
+
+**Code → Download ZIP**
+
+解压后进入项目文件夹。
+
+需要：
+
+* Python 3.10+
+* 不需要安装第三方依赖
+
+## 2. 把项目交给你的 AI
+
+适合直接游玩的 AI，一般是能够操作终端或运行代码的 Agent，例如：
+
+* Claude Code
+* OpenAI Codex
+* Gemini CLI
+* 其他能够执行本地命令的 AI Agent
+
+把整个项目文件夹交给它，然后直接告诉它：
+
+> 阅读 README，使用 `agent` 接口自己开一局《坩埚余响》。始终使用同一个存档路径，每一步读取 `[STATE]` 后根据 `available_actions` 自己决定下一步，一直玩到胜利或失败。不要直接修改存档文件。
+
+然后人类就可以搬个椅子坐旁边看了。
+
+## 3. AI 实际上会怎么操作
+
+AI 首先创建一局游戏：
+
+```bash
+python game.py agent new --seed 42 --difficulty 1 --save .saves/ai.json
+```
+
+游戏会返回一行：
+
+```text
+[STATE] {"protocol":"crucible-echoes-agent/v1", ...}
+```
+
+这里包含当前完整游戏状态，以及 AI 下一步可以执行的操作。
+
+例如 AI 看到可以旋转，就会执行：
+
+```bash
+python game.py agent spin --save .saves/ai.json
+```
+
+出现成分候选后，它可能选择第 2 个：
+
+```bash
+python game.py agent choose 2 --save .saves/ai.json
+```
+
+然后继续：
+
+```bash
+python game.py agent spin --save .saves/ai.json
+```
+
+整个过程就是：
+
+**读取状态 → 自己思考 → 执行一个动作 → 读取新状态 → 再思考**
+
+一直循环到本局结束。
+
+## 4. AI 可以执行哪些操作
+
+目前支持：
+
+```text
+new
+status
+spin
+choose N
+skip
+reroll
+remove N
+inventory
+use ITEM_ID
+help
+```
+
+例如：
+
+```bash
+python game.py agent inventory --save .saves/ai.json
+```
+
+查看完整库存。
+
+```bash
+python game.py agent reroll --save .saves/ai.json
+```
+
+使用 Roll Token 重调当前候选。
+
+```bash
+python game.py agent remove 7 --save .saves/ai.json
+```
+
+移除库存中的第 7 个成分。
+
+AI 不需要自己猜哪些操作合法，因为 `[STATE]` 中会提供：
+
+```text
+available_actions
+available_action_specs
+```
+
+让它知道当前真正可以做什么。
+
+## 5. 最重要的一件事：一直使用同一个存档
+
+同一局游戏必须始终使用同一个：
+
+```text
+--save .saves/ai.json
+```
+
+例如不要上一回合用：
+
+```text
+.saves/ai.json
+```
+
+下一回合突然换成：
+
+```text
+.saves/test.json
+```
+
+否则那已经是另一份游戏状态了。
+
+《坩埚余响》的随机数状态也保存在存档中，因此：
+
+**相同 seed + 相同操作序列 = 相同结果。**
+
+AI 不能靠反复重启程序偷偷刷新随机结果。
+
+## 6. 如果 AI 不知道该怎么玩
+
+可以直接把下面这段发给它：
+
+> 你现在要独立游玩《坩埚余响》。请先阅读项目 README，然后只使用 `python game.py agent ...` 接口进行游戏。创建一局后始终使用同一个 save 文件。每次命令执行后读取 `[STATE]` JSON，分析当前订单、金币、实验池、候选、道具、精粹、最近盘面和 `available_actions`，自行选择你认为最优的下一步。一次只执行一个动作，不要直接编辑存档，不要让我替你做决定，并持续游玩直到胜利或失败。过程中可以向我解释你的构筑思路和重要决策。
+
+这样它通常就能自己开始。
+
+## 7. 普通聊天 AI 能直接玩吗？
+
+如果只是普通网页聊天窗口，而且它：
+
+* 不能执行终端命令
+* 不能访问你的本地文件
+* 没有连接相应工具
+
+那么目前不能完全自动游玩。
+
+你仍然可以把每一步 `[STATE]` 发给它，让它决定下一步，然后由你帮它执行命令。
+
+也就是说，人类暂时会变成一个性能稳定但接口设计十分古老的 MCP。
+
+等《坩埚余响》的 MCP 版本完成后，这类 AI 也可以直接通过工具自己操作游戏，不需要人类来回复制命令。
+
+## 一句话版本
+
+把项目下载下来，交给一个能运行终端的 AI，然后告诉它：
+
+> **“读 README，用 agent 接口自己开一局，一直玩到结束。”**
+
+剩下的就让它自己炼。🧪
+
+
+
+
 ## 快速开始
 
 需要 Python 3.10 或更高版本，不依赖第三方包。
