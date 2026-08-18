@@ -1250,3 +1250,166 @@ class GameEngine:
             "pending": None if not choice else {"kind":choice.kind,"offers":list(choice.offers),"can_skip":choice.can_skip,"source":choice.source},
             "last_board": list(self.s.last_board), "last_log": list(self.s.last_log),
         }
+
+    def _definition_view(self, kind: str, def_id: str) -> dict[str, Any]:
+        """Return a JSON-safe copy of a catalog definition for agent clients."""
+        if kind == "ingredient":
+            definition = self.catalog.ingredients[def_id]
+        elif kind == "item":
+            definition = self.catalog.items[def_id]
+        elif kind == "essence":
+            definition = self.catalog.essences[def_id]
+        else:
+            raise GameError(f"unknown catalog kind: {kind}")
+        return dict(definition)
+
+    def agent_available_actions(self) -> list[str]:
+        """Return canonical one-step commands currently accepted by the engine.
+
+        The strings are intentionally executable command forms so an agent can
+        select one without having to infer positional arguments from another
+        field.  Read-only actions remain available after a run has ended.
+        """
+        actions = ["status", "inventory", "help"]
+        if self.s.status != "playing":
+            return actions
+        if self.s.pending:
+            choice = self.s.pending[0]
+            actions.extend(f"choose {index}" for index in range(1, len(choice.offers) + 1))
+            if choice.can_skip:
+                actions.append("skip")
+            if choice.kind != "essence" and self.s.tokens.get("roll", 0) > 0:
+                actions.append("reroll")
+            return actions
+        actions.append("spin")
+        if self.s.tokens.get("remove", 0) > 0:
+            for index, instance in enumerate(self.s.ingredients, 1):
+                definition = self.catalog.ingredients[instance.def_id]
+                if definition.get("removable", True):
+                    actions.append(f"remove {index}")
+        for item_id in self.s.items:
+            active = self.catalog.items[item_id].get("active")
+            if not active:
+                continue
+            if active.get("order_book") and self.s.spins_left != 1:
+                continue
+            actions.append(f"use {item_id}")
+        return actions
+
+    def agent_action_specs(self) -> list[dict[str, Any]]:
+        """Return structured equivalents of :meth:`agent_available_actions`."""
+        specs: list[dict[str, Any]] = [
+            {"action": "status"},
+            {"action": "inventory"},
+            {"action": "help"},
+        ]
+        if self.s.status != "playing":
+            return specs
+        if self.s.pending:
+            choice = self.s.pending[0]
+            for index, def_id in enumerate(choice.offers, 1):
+                specs.append({"action": "choose", "index": index, "id": def_id})
+            if choice.can_skip:
+                specs.append({"action": "skip"})
+            if choice.kind != "essence" and self.s.tokens.get("roll", 0) > 0:
+                specs.append({"action": "reroll"})
+            return specs
+        specs.append({"action": "spin"})
+        if self.s.tokens.get("remove", 0) > 0:
+            for index, instance in enumerate(self.s.ingredients, 1):
+                definition = self.catalog.ingredients[instance.def_id]
+                if definition.get("removable", True):
+                    specs.append({"action": "remove", "index": index, "id": instance.def_id})
+        for item_id in self.s.items:
+            active = self.catalog.items[item_id].get("active")
+            if active and (not active.get("order_book") or self.s.spins_left == 1):
+                specs.append({"action": "use", "item_id": item_id})
+        return specs
+
+    def agent_payload(
+        self,
+        action: str,
+        *,
+        ok: bool = True,
+        error: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build the stable machine-readable state envelope.
+
+        ``state`` is the complete persisted game state.  The additional view
+        fields provide catalog metadata and queue details needed to make the
+        next decision without loading project data separately.
+        """
+        payload = self.status_payload()
+        state = self.s
+        amount, total_spins = self.current_order()
+
+        ingredients: list[dict[str, Any]] = []
+        for slot, instance in enumerate(state.ingredients, 1):
+            row = {
+                "slot": slot,
+                "uid": instance.uid,
+                "id": instance.def_id,
+                "permanent_bonus": instance.permanent_bonus,
+                "age": instance.age,
+                "counter": instance.counter,
+                "stored_gold": instance.stored_gold,
+                "flags": dict(instance.flags),
+                "definition": self._definition_view("ingredient", instance.def_id),
+            }
+            ingredients.append(row)
+
+        items = [self._definition_view("item", item_id) for item_id in state.items]
+        essences = [self._definition_view("essence", essence_id) for essence_id in state.essences]
+        pending_choices: list[dict[str, Any]] = []
+        for queue_index, choice in enumerate(state.pending):
+            kind = choice.kind
+            offers = [
+                {
+                    "index": index,
+                    "id": def_id,
+                    "definition": self._definition_view(kind, def_id),
+                }
+                for index, def_id in enumerate(choice.offers, 1)
+            ]
+            pending_choices.append(
+                {
+                    "queue_index": queue_index,
+                    "kind": kind,
+                    "source": choice.source,
+                    "can_skip": choice.can_skip,
+                    "offers": offers,
+                }
+            )
+
+        payload.update(
+            {
+                "protocol": "crucible-echoes-agent/v1",
+                "ok": ok,
+                "action": action,
+                "error": error,
+                "state": state.to_dict(),
+                "order_detail": {
+                    "number": state.order_index + 1,
+                    "completed": state.order_index,
+                    "amount": amount,
+                    "spins_left": state.spins_left,
+                    "spins_total": total_spins,
+                },
+                "ingredients": ingredients,
+                "items_detail": items,
+                "essences_detail": essences,
+                "pending_choices": pending_choices,
+                "consumed_essences": list(state.consumed_essences),
+                "removed_history": list(state.removed_history),
+                "acquired_once": list(state.acquired_once),
+                "expanded": state.expanded,
+                "rarity_multiplier": state.rarity_multiplier,
+                "flags": dict(state.flags),
+                "stats": state.stats,
+                "last_board": list(state.last_board),
+                "last_log": list(state.last_log),
+                "available_actions": self.agent_available_actions(),
+                "available_action_specs": self.agent_action_specs(),
+            }
+        )
+        return payload

@@ -54,6 +54,28 @@ def build_parser() -> argparse.ArgumentParser:
     use = sub.add_parser("use")
     use.add_argument("item_id")
     use.add_argument("--save", default=str(DEFAULT_SAVE))
+
+    # Keep the machine interface separate from the human-oriented commands.
+    # Every ``agent`` invocation performs at most one action and emits one
+    # [STATE] JSON line.
+    agent = sub.add_parser("agent", help="执行一个无状态 AI agent 动作")
+    agent_sub = agent.add_subparsers(dest="agent_action", required=True)
+    agent_new = agent_sub.add_parser("new", help="创建新存档")
+    agent_new.add_argument("--seed", type=int, default=1)
+    agent_new.add_argument("--difficulty", type=int, default=1)
+    agent_new.add_argument("--save", default=str(DEFAULT_SAVE))
+    for name in ("status", "spin", "skip", "reroll", "inventory", "help"):
+        child = agent_sub.add_parser(name)
+        child.add_argument("--save", default=str(DEFAULT_SAVE))
+    agent_choose = agent_sub.add_parser("choose")
+    agent_choose.add_argument("number")
+    agent_choose.add_argument("--save", default=str(DEFAULT_SAVE))
+    agent_remove = agent_sub.add_parser("remove")
+    agent_remove.add_argument("number")
+    agent_remove.add_argument("--save", default=str(DEFAULT_SAVE))
+    agent_use = agent_sub.add_parser("use")
+    agent_use.add_argument("item_id")
+    agent_use.add_argument("--save", default=str(DEFAULT_SAVE))
     return parser
 
 
@@ -117,6 +139,90 @@ def execute(engine: GameEngine, command: str, args: list[str]) -> str:
     return render(engine, inventory=command == "remove")
 
 
+def apply_action(engine: GameEngine, command: str, args: list[str]) -> None:
+    """Apply exactly one mutating action without producing presentation text."""
+    if command == "spin":
+        engine.spin()
+    elif command == "choose":
+        engine.choose(int(args[0]))
+    elif command == "skip":
+        engine.skip()
+    elif command == "reroll":
+        engine.reroll()
+    elif command == "remove":
+        engine.remove(int(args[0]))
+    elif command == "use":
+        engine.use_item(args[0])
+    else:
+        raise GameError(f"未知命令：{command}")
+
+
+def print_agent_state(payload: dict[str, object]) -> None:
+    """Emit one and only one machine-readable line for an agent action."""
+    print("[STATE] " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+
+def run_agent(ns: argparse.Namespace) -> int:
+    """Execute one agent action in one process, persisting the JSON save."""
+    action = ns.agent_action
+    save_path = Path(getattr(ns, "save", DEFAULT_SAVE))
+    engine: GameEngine | None = None
+    try:
+        if action == "new":
+            engine = GameEngine()
+            engine.new_game(ns.seed, ns.difficulty)
+            save_game(engine.s, save_path)
+            print_agent_state(engine.agent_payload(action))
+            return 0
+
+        if not save_path.exists():
+            raise GameError(f"找不到存档：{save_path}；请先运行 agent new")
+        engine = load_engine(save_path)
+
+        if action == "help":
+            payload = engine.agent_payload(action)
+            payload["agent_help"] = {
+                "command": "python game.py agent ACTION --save PATH",
+                "actions": ["new", "status", "spin", "choose N", "skip", "reroll", "remove N", "inventory", "use ITEM_ID"],
+                "contract": "每次进程只执行一个动作；成功或失败都输出一行 [STATE] JSON。",
+            }
+            print_agent_state(payload)
+            return 0
+
+        if action not in {"status", "inventory"}:
+            args: list[str] = []
+            if action in {"choose", "remove"}:
+                args = [str(ns.number)]
+            elif action == "use":
+                args = [ns.item_id]
+            apply_action(engine, action, args)
+            save_game(engine.s, save_path)
+        print_agent_state(engine.agent_payload(action))
+        return 0
+    except (GameError, ValueError, IndexError, OSError) as exc:
+        if engine is not None:
+            print_agent_state(
+                engine.agent_payload(
+                    action,
+                    ok=False,
+                    error={"type": type(exc).__name__, "message": str(exc)},
+                )
+            )
+        else:
+            print_agent_state(
+                {
+                    "protocol": "crucible-echoes-agent/v1",
+                    "ok": False,
+                    "action": action,
+                    "error": {"type": type(exc).__name__, "message": str(exc)},
+                    "state": None,
+                    "available_actions": ["new"],
+                    "available_action_specs": [{"action": "new"}],
+                }
+            )
+        return 2
+
+
 def interactive(save_path: Path, seed: int, difficulty: int) -> int:
     if save_path.exists():
         engine = load_engine(save_path)
@@ -149,6 +255,8 @@ def main(argv: list[str] | None = None) -> int:
     command = ns.command or "start"
     save_path = Path(getattr(ns, "save", DEFAULT_SAVE))
     try:
+        if command == "agent":
+            return run_agent(ns)
         if command == "new":
             engine = GameEngine(); engine.new_game(ns.seed, ns.difficulty); save_game(engine.s, save_path)
             print(render(engine)); return 0
