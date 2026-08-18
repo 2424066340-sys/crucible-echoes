@@ -96,3 +96,7 @@ docs/SPEC.md                    冻结规则规格
 ```
 
 欢迎新增成分、道具、精粹、测试和数值平衡修订。
+
+
+
+Developed with assistance from ChatGPT (OpenAI).
