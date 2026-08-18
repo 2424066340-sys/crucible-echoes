@@ -159,7 +159,9 @@ def apply_action(engine: GameEngine, command: str, args: list[str]) -> None:
 
 def print_agent_state(payload: dict[str, object]) -> None:
     """Emit one and only one machine-readable line for an agent action."""
-    print("[STATE] " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    # ASCII escaping keeps the protocol valid through legacy Windows code pages;
+    # JSON parsers restore the original Unicode strings automatically.
+    print("[STATE] " + json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
 
 
 def run_agent(ns: argparse.Namespace) -> int:
