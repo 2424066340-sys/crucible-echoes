@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crucible-echoes"
+version = "0.1.0"
+description = "A deterministic, data-driven text alchemy deckbuilding roguelike"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{name = "Crucible Echoes contributors"}]
+dependencies = []
+
+[project.scripts]
+crucible-echoes = "crucible_echoes.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.package-data]
+crucible_echoes = ["data/*.json"]
+

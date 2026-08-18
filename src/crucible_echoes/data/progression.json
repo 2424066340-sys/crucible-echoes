@@ -1,0 +1,47 @@
+{
+  "initial_ingredients": ["water", "charcoal", "cauldron", "kitten", "test_tube"],
+  "starting_gold": 1,
+  "ingredient_rarity": {
+    "0": [100.0, 0.0, 0.0, 0.0],
+    "1": [88.0, 12.0, 0.0, 0.0],
+    "2": [75.0, 23.4, 1.5, 0.1],
+    "3": [73.0, 25.0, 1.8, 0.2],
+    "4": [67.0, 30.0, 2.5, 0.5],
+    "5+": [65.0, 31.5, 2.8, 0.7]
+  },
+  "item_rarity": {
+    "0": [100.0, 0.0, 0.0, 0.0],
+    "1": [88.0, 12.0, 0.0, 0.0],
+    "2": [75.0, 23.4, 1.5, 0.1],
+    "3": [73.0, 25.0, 1.8, 0.2],
+    "4": [68.0, 29.0, 2.0, 1.0],
+    "5": [66.5, 30.0, 2.2, 1.3],
+    "6+": [59.5, 35.0, 3.7, 1.8]
+  },
+  "orders": [
+    {"amount": 25, "spins": 5},
+    {"amount": 50, "spins": 5},
+    {"amount": 100, "spins": 6},
+    {"amount": 150, "spins": 6},
+    {"amount": 225, "spins": 7},
+    {"amount": 300, "spins": 7},
+    {"amount": 350, "spins": 8},
+    {"amount": 425, "spins": 8},
+    {"amount": 575, "spins": 9},
+    {"amount": 625, "spins": 9},
+    {"amount": 675, "spins": 10},
+    {"amount": 777, "spins": 10},
+    {"amount": 1000, "spins": 10}
+  ],
+  "difficulty": {
+    "2": {"order_bonus": {"7": 25}},
+    "3": {"order_bonus": {"8": 25}},
+    "4": {"token_reward": 1},
+    "5": {"initial_slag": 1},
+    "6": {"order_bonus": {"10": 25}, "initial_slag": 2},
+    "7": {"order_bonus": {"11": 25}, "slag_interval": 25},
+    "8": {"initial_slag": 3, "slag_interval": 20},
+    "9": {"order_bonus": {"9": 25}, "slag_interval": 15},
+    "10": {"final_marker": true}
+  }
+}

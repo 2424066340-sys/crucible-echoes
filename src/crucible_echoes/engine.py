@@ -1,0 +1,1252 @@
+from __future__ import annotations
+
+from collections import Counter, defaultdict
+from typing import Any, Iterable
+
+from .catalog import Catalog
+from .geometry import adjacent_indices, board_coords, is_corner, is_edge
+from .model import GameState, IngredientInstance, PendingChoice
+from .rng import DeterministicRNG
+
+
+class GameError(RuntimeError):
+    pass
+
+
+class GameEngine:
+    def __init__(self, catalog: Catalog | None = None):
+        self.catalog = catalog or Catalog.load()
+        self.state: GameState | None = None
+        self.rng: DeterministicRNG | None = None
+        self._round_events: defaultdict[str, int] = defaultdict(int)
+        self._round_event_values: defaultdict[str, int] = defaultdict(int)
+        self._board: list[IngredientInstance] = []
+        self._coords: list[tuple[int, int]] = []
+        self._values: list[int] = []
+        self._all_adjacent = False
+        self._panorama = False
+        self._removed_values: list[tuple[int, int]] = []
+
+    def new_game(self, seed: int, difficulty: int = 1) -> GameState:
+        if not 1 <= difficulty <= 10:
+            raise GameError("难度必须在1到10之间")
+        self.rng = DeterministicRNG(seed & ((1 << 64) - 1))
+        first = self.current_order_for(0, difficulty, {})
+        state = GameState(
+            version=1,
+            seed=seed,
+            rng_state=self.rng.state,
+            difficulty=difficulty,
+            gold=int(self.catalog.progression["starting_gold"]),
+            status="playing",
+            spin=0,
+            order_index=0,
+            spins_left=first[1],
+            next_uid=1,
+            stats={"event_counts": {}, "event_values": {}, "essence_baseline": {}, "essence_hits": {}, "seen_types": []},
+        )
+        self.state = state
+        for def_id in self.catalog.progression["initial_ingredients"]:
+            self.add_ingredient(def_id, emit=False)
+        for _ in range(self.initial_slag_count(difficulty)):
+            self.add_ingredient("slag", emit=False)
+        state.last_log = [f"新实验开始：seed={seed}，难度={difficulty}。"]
+        self._sync_rng()
+        return state
+
+    def bind(self, state: GameState) -> "GameEngine":
+        self.state = state
+        self.rng = DeterministicRNG(state.rng_state)
+        return self
+
+    @property
+    def s(self) -> GameState:
+        if self.state is None:
+            raise GameError("尚未载入游戏")
+        return self.state
+
+    @property
+    def r(self) -> DeterministicRNG:
+        if self.rng is None:
+            raise GameError("随机数生成器尚未初始化")
+        return self.rng
+
+    def _sync_rng(self) -> None:
+        self.s.rng_state = self.r.state
+
+    @staticmethod
+    def initial_slag_count(difficulty: int) -> int:
+        if difficulty >= 8:
+            return 3
+        if difficulty >= 6:
+            return 2
+        if difficulty >= 5:
+            return 1
+        return 0
+
+    @staticmethod
+    def slag_interval(difficulty: int) -> int | None:
+        if difficulty >= 9:
+            return 15
+        if difficulty >= 8:
+            return 20
+        if difficulty >= 7:
+            return 25
+        return None
+
+    def current_order_for(self, completed: int, difficulty: int, flags: dict[str, Any]) -> tuple[int, int]:
+        rows = self.catalog.progression["orders"]
+        if completed < len(rows):
+            amount = int(rows[completed]["amount"])
+            spins = int(rows[completed]["spins"])
+        else:
+            amount = 1000 + 500 * (completed - 12)
+            spins = 10
+        number = completed + 1
+        bonus_thresholds = {7: 2, 8: 3, 10: 6, 11: 7, 9: 9}
+        if difficulty >= bonus_thresholds.get(number, 99):
+            amount += 25
+        if flags.get("next_order_penalty"):
+            amount = int((amount * 1.25) + 0.9999)
+        return amount, spins
+
+    def current_order(self) -> tuple[int, int]:
+        return self.current_order_for(self.s.order_index, self.s.difficulty, self.s.flags)
+
+    def rarity_table(self, kind: str) -> list[float]:
+        completed = self.s.order_index
+        source = self.catalog.progression[f"{kind}_rarity"]
+        if str(completed) in source:
+            base = list(map(float, source[str(completed)]))
+        else:
+            cap = 5 if kind == "ingredient" else 6
+            base = list(map(float, source[f"{cap}+"]))
+        multiplier = self.current_rarity_multiplier()
+        high = [base[1] * multiplier, base[2] * multiplier, base[3] * multiplier]
+        remaining = 100.0
+        result = [0.0, 0.0, 0.0, 0.0]
+        for index in (3, 2, 1):
+            value = min(remaining, high[index - 1])
+            result[index] = max(0.0, value)
+            remaining -= result[index]
+        result[0] = max(0.0, remaining)
+        return result
+
+    def current_rarity_multiplier(self) -> float:
+        multiplier = float(self.s.rarity_multiplier)
+        disable_negative = self.negative_disabled()
+        for instance in self.s.ingredients:
+            definition = self.catalog.ingredients[instance.def_id]
+            if disable_negative and "negative" in definition.get("tags", []):
+                continue
+            multiplier *= float(definition.get("rarity_multiplier", 1.0))
+        for item_id in self.s.items:
+            multiplier *= float(self.catalog.items[item_id].get("rarity_multiplier", 1.0))
+        return multiplier
+
+    def negative_disabled(self) -> bool:
+        return "holy_water" in self.s.items or any(x.def_id == "white_mage" for x in self.s.ingredients)
+
+    def roll_rarity(self, kind: str, minimum: int = 1, maximum: int = 4) -> int:
+        table = self.rarity_table(kind)
+        weighted = [(rarity, table[rarity - 1]) for rarity in range(minimum, maximum + 1)]
+        if sum(weight for _, weight in weighted) <= 0:
+            available = [rarity for rarity in range(minimum, maximum + 1) if self._defs_at_rarity(kind, rarity)]
+            return self.r.choice(available)
+        return self.r.weighted_choice(weighted)
+
+    def _defs_at_rarity(self, kind: str, rarity: int, *, tag: str | None = None, exclude: set[str] | None = None) -> list[dict[str, Any]]:
+        collection = self.catalog.ingredients if kind == "ingredient" else self.catalog.items
+        rows = []
+        for row in collection.values():
+            if int(row.get("rarity", 0)) != rarity:
+                continue
+            if not row.get("offerable", True):
+                continue
+            if row.get("unique") and row["id"] in self.s.acquired_once:
+                continue
+            if kind == "item" and row["id"] in self.s.items:
+                continue
+            if exclude and row["id"] in exclude:
+                continue
+            if tag and tag not in row.get("tags", []):
+                continue
+            rows.append(row)
+        return rows
+
+    def _draw_definition(self, kind: str, rarity: int, *, tag: str | None = None, exclude: set[str] | None = None) -> str:
+        rows = self._defs_at_rarity(kind, rarity, tag=tag, exclude=exclude)
+        if not rows and tag:
+            rows = self._defs_at_rarity(kind, rarity, exclude=exclude)
+        if not rows:
+            for fallback in range(rarity - 1, 0, -1):
+                rows = self._defs_at_rarity(kind, fallback, tag=tag, exclude=exclude)
+                if rows:
+                    break
+        if not rows:
+            raise GameError(f"{kind}池中没有可抽取定义")
+        return self.r.weighted_choice([(row["id"], float(row.get("pool_weight", 1.0))) for row in rows])
+
+    def make_choice(self, kind: str, count: int = 3, *, minimums: list[int] | None = None, fixed_rarity: int | None = None, source: str = "spin", can_skip: bool = True) -> PendingChoice:
+        if kind == "essence":
+            rows = [row for row in self.catalog.essences.values() if row["id"] not in self.s.essences and row["id"] not in self.s.consumed_essences]
+            self.r.shuffle(rows)
+            offers = [row["id"] for row in rows[:count]]
+            return PendingChoice(kind="essence", offers=offers, can_skip=can_skip, source=source)
+        extra = 0
+        if kind == "ingredient":
+            extra += int(self.s.flags.pop("ingredient_choice_extra", 0))
+            if self.s.flags.get("credit_card_bonus"):
+                extra += int(self.s.flags.pop("credit_card_bonus"))
+            if self.s.flags.pop("blank_choice", False):
+                count = 1
+            if self.s.flags.pop("mundane_choice", False):
+                fixed_rarity = 1
+            if self.s.flags.pop("force_rarity4", False):
+                minimums = [4]
+            elif self.s.flags.pop("lucky_choice", False):
+                minimums = [3]
+        elif kind == "item":
+            extra += int(self.s.flags.pop("item_choice_extra", 0))
+            extra += sum(int(self.catalog.items[item].get("item_choice_bonus", 0)) for item in self.s.items)
+        count += extra
+        minimums = list(minimums or [])
+        offers: list[str] = []
+        for index in range(count):
+            if fixed_rarity:
+                rarity = fixed_rarity
+            elif index < len(minimums):
+                rarity = self.roll_rarity(kind, minimum=minimums[index])
+            else:
+                rarity = self.roll_rarity(kind)
+            offers.append(self._draw_definition(kind, rarity, exclude=set(offers)))
+        if kind == "ingredient" and "lucky_compass" in self.s.items and offers:
+            slot = self.r.randint(0, len(offers) - 1)
+            table = self.rarity_table("ingredient")
+            boosted = [(rarity, table[rarity - 1] * (1.2 if rarity >= 2 else 1.0)) for rarity in range(1, 5)]
+            rarity = self.r.weighted_choice(boosted)
+            offers[slot] = self._draw_definition("ingredient", rarity, exclude=set(offers[:slot] + offers[slot + 1:]))
+        choice = PendingChoice(kind=kind, offers=offers, can_skip=can_skip, source=source)
+        self._record_choice_events(choice)
+        return choice
+
+    def _record_choice_events(self, choice: PendingChoice) -> None:
+        if choice.kind not in {"ingredient", "item"}:
+            return
+        collection = self.catalog.ingredients if choice.kind == "ingredient" else self.catalog.items
+        rarities = [int(collection[x]["rarity"]) for x in choice.offers]
+        if rarities and all(x == 1 for x in rarities):
+            self.emit("all_common_choice")
+            if "probability_calibrator" in self.s.items:
+                self._gain_gold(5, "概率校准器")
+        self.s.stats["last_choice_rarities"] = rarities
+
+    def add_ingredient(self, def_id: str, *, emit: bool = True, permanent_bonus: int = 0) -> IngredientInstance | None:
+        definition = self.catalog.ingredients[def_id]
+        if definition.get("unique") and def_id in self.s.acquired_once:
+            return None
+        if definition.get("on_acquire") == "expand_board":
+            self.s.expanded = True
+            if def_id not in self.s.acquired_once:
+                self.s.acquired_once.append(def_id)
+            self.s.last_log.append("工程图纸自动展开：实验台永久增加至21格。")
+            return None
+        instance = IngredientInstance(uid=self.s.next_uid, def_id=def_id, permanent_bonus=permanent_bonus)
+        self.s.next_uid += 1
+        self.s.ingredients.append(instance)
+        if definition.get("unique") and def_id not in self.s.acquired_once:
+            self.s.acquired_once.append(def_id)
+        if emit:
+            self.emit("ingredient_added")
+            seen = set(self.s.stats.setdefault("seen_types", []))
+            if def_id not in seen:
+                self.s.stats["seen_types"].append(def_id)
+                self.emit("new_ingredient_type")
+                if "refined_catalog" in self.s.items:
+                    self._gain_gold(4, "精炼目录")
+            rarity = int(definition.get("rarity", 0))
+            if rarity >= 3:
+                self.emit("chosen_rare")
+            if "venture_capital" in self.s.items:
+                self._gain_gold(8 if rarity >= 3 else (-1 if rarity == 1 else 0), "风险投资")
+            if "animal" in definition.get("tags", []) and "animal_registry" in self.s.items:
+                key = f"animal_seen:{def_id}"
+                if not self.s.stats.get(key):
+                    self.s.stats[key] = True
+                    self._gain_gold(6, "动物登记册")
+                    self.emit("new_animal")
+        return instance
+
+    def add_item(self, item_id: str) -> None:
+        if item_id in self.s.items:
+            return
+        self.s.items.append(item_id)
+        self.s.last_log.append(f"获得道具：{self.catalog.items[item_id]['name']}。")
+        data = self.catalog.items[item_id]
+        acquire = data.get("on_acquire", {})
+        for _ in range(int(acquire.get("ingredient_choices", 0))):
+            self.s.pending.append(self.make_choice("ingredient", source=item_id))
+        for rarity in acquire.get("fixed_ingredient_choices", []):
+            self.s.pending.append(self.make_choice("ingredient", fixed_rarity=int(rarity), source=item_id))
+
+    def add_essence(self, essence_id: str) -> None:
+        if essence_id in self.s.essences or essence_id in self.s.consumed_essences:
+            return
+        self.s.essences.append(essence_id)
+        counts = dict(self.s.stats.setdefault("event_counts", {}))
+        values = dict(self.s.stats.setdefault("event_values", {}))
+        self.s.stats.setdefault("essence_baseline", {})[essence_id] = {"events": counts, "values": values, "spin": self.s.spin}
+        self.s.last_log.append(f"获得精粹：{self.catalog.essences[essence_id]['name']}。")
+
+    def emit(self, event: str, amount: int = 1, value: int = 0) -> None:
+        self._round_events[event] += amount
+        if value:
+            self._round_event_values[event] += value
+        totals = self.s.stats.setdefault("event_counts", {})
+        totals[event] = int(totals.get(event, 0)) + amount
+        values = self.s.stats.setdefault("event_values", {})
+        values[event] = int(values.get(event, 0)) + value
+        for item_id in list(self.s.items):
+            item = self.catalog.items[item_id]
+            bonus = item.get("event_bonus", {})
+            if event in bonus:
+                self._gain_gold(int(bonus[event]) * amount, item["name"])
+            script = item.get("script")
+            round_key = f"item:{item_id}:{event}"
+            if script == "reaction_window" and event in {"removed", "generated", "transformed"} and not self._round_events.get(round_key):
+                self._round_events[round_key] = 1
+                self._gain_gold(3, item["name"])
+            elif script == "alchemy_insurance" and event == "removed" and not self._round_events.get(round_key):
+                self._round_events[round_key] = 1
+                self._gain_gold(4, item["name"])
+                self.emit("insurance")
+            elif script == "counter_calibrator" and event == "periodic" and not self._round_events.get(round_key):
+                self._round_events[round_key] = 1
+                self._gain_gold(3, item["name"])
+            elif script == "experiment_notebook" and event == "permanent_bonus" and self._round_events.get(round_key, 0) < 3:
+                self._round_events[round_key] += 1
+                self._gain_gold(1, item["name"])
+            elif script == "cat_observation_log" and event == "cat_bonus" and not self._round_events.get(round_key):
+                self._round_events[round_key] = 1
+                self._gain_gold(4, item["name"])
+
+    def _gain_gold(self, amount: int, source: str) -> None:
+        if amount == 0:
+            return
+        self.s.gold += amount
+        self.s.last_log.append(f"{source}：{amount:+d}g。")
+
+    def _has_tag(self, instance: IngredientInstance, tag: str) -> bool:
+        return tag in self.catalog.ingredients[instance.def_id].get("tags", [])
+
+    def _neighbors(self, index: int) -> list[int]:
+        if self._all_adjacent:
+            return [i for i in range(len(self._board)) if i != index]
+        regular = set(adjacent_indices(self._coords, index))
+        if self._panorama:
+            corners = {i for i, coord in enumerate(self._coords) if is_corner(coord)}
+            if index in corners:
+                return [i for i in range(len(self._board)) if i != index]
+            regular.update(corners)
+            regular.discard(index)
+        return sorted(regular)
+
+    def _present(self, instance: IngredientInstance) -> bool:
+        return any(x.uid == instance.uid for x in self.s.ingredients)
+
+    def _item_bonus(self, definition: dict[str, Any]) -> int:
+        total = 0
+        tags = set(definition.get("tags", []))
+        for item_id in self.s.items:
+            for bonus in self.catalog.items[item_id].get("bonuses", []):
+                if bonus.get("rarity") and int(bonus["rarity"]) != int(definition.get("rarity", 0)):
+                    continue
+                matches = False
+                if bonus.get("id") == definition["id"]:
+                    matches = True
+                if definition["id"] in bonus.get("ids", []):
+                    matches = True
+                if bonus.get("tag") in tags:
+                    matches = True
+                if tags.intersection(bonus.get("tags", [])):
+                    matches = True
+                if "base" in bonus and int(bonus["base"]) == int(definition.get("base", 0)):
+                    matches = True
+                if matches:
+                    total += int(bonus.get("amount", 0))
+        return total
+
+    def _base_values(self) -> list[int]:
+        values: list[int] = []
+        for i, instance in enumerate(self._board):
+            definition = self.catalog.ingredients[instance.def_id]
+            value = int(definition.get("base", 0)) + instance.permanent_bonus + self._item_bonus(definition)
+            spec = definition.get("value", {})
+            neighbors = [self._board[n] for n in self._neighbors(i)]
+            tags = set(definition.get("tags", []))
+            if spec.get("if_adjacent_tag") and any(self._has_tag(x, spec["if_adjacent_tag"]) for x in neighbors):
+                value += int(spec.get("bonus", 0)); self.emit("adjacency")
+            if spec.get("if_adjacent_ids") and any(x.def_id in spec["if_adjacent_ids"] for x in neighbors):
+                value += int(spec.get("bonus", 0)); self.emit("adjacency")
+            if spec.get("if_no_adjacent_tag") and not any(self._has_tag(x, spec["if_no_adjacent_tag"]) for x in neighbors):
+                value += int(spec.get("bonus", 0))
+            if spec.get("position") == "edge" and is_edge(self._coords[i]):
+                value += int(spec.get("bonus", 0))
+            if spec.get("position") == "corner" and is_corner(self._coords[i]):
+                value += int(spec.get("bonus", 0))
+            if spec.get("count_id"):
+                value += sum(1 for x in self._board if x.def_id == spec["count_id"]) * int(spec.get("per", 1))
+            if spec.get("count_adjacent_tag"):
+                value += sum(1 for x in neighbors if self._has_tag(x, spec["count_adjacent_tag"])) * int(spec.get("per", 1))
+                self.emit("adjacency")
+            if "random_min" in spec:
+                value += self.r.randint(int(spec["random_min"]), int(spec["random_max"]))
+                self.emit("chance_checked")
+            if "coin_flip" in spec:
+                forced = bool(self.s.flags.pop("coin_force_success", False))
+                success = forced or self._chance(0.5)
+                value += int(spec["coin_flip"]) if success else 0
+                instance.flags["coin_success"] = success
+                if not success and any(x.def_id == "lucky_coin" for x in self.s.ingredients):
+                    self.s.flags["coin_force_success"] = True
+            if spec.get("chance_zero") and not self.negative_disabled() and self._chance(float(spec["chance_zero"]), negative=True):
+                value = 0
+            values.append(value)
+            if "cat" in tags and value > int(definition.get("base", 0)):
+                self.emit("cat_bonus")
+        return values
+
+    def _apply_multipliers(self, values: list[int]) -> list[int]:
+        result = [float(x) for x in values]
+        for i, source in enumerate(self._board):
+            definition = self.catalog.ingredients[source.def_id]
+            aura = definition.get("aura")
+            if aura:
+                for n in self._neighbors(i):
+                    target = self.catalog.ingredients[self._board[n].def_id]
+                    target_tags = set(target.get("tags", []))
+                    matches = aura.get("id") == target["id"] or target["id"] in aura.get("ids", [])
+                    matches = matches or aura.get("tag") in target_tags or bool(target_tags.intersection(aura.get("tags", [])))
+                    if matches:
+                        result[n] *= float(aura["multiplier"]); self.emit("adjacency")
+        for i, source in enumerate(self._board):
+            definition = self.catalog.ingredients[source.def_id]
+            if definition.get("script") == "double_potion":
+                for n in self._neighbors(i):
+                    result[n] *= 2; self.emit("adjacency")
+            if definition.get("script") == "focus_lens":
+                neighbors = self._neighbors(i)
+                if neighbors:
+                    result[self.r.choice(neighbors)] *= 2; self.emit("adjacency")
+        directions = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+        coord_to_index = {coord: i for i, coord in enumerate(self._coords)}
+        for i, source in enumerate(self._board):
+            definition = self.catalog.ingredients[source.def_id]
+            if definition.get("prism"):
+                times = 1 + sum(int(self.catalog.items[x].get("extra_prism_directions", 0)) for x in self.s.items)
+                for _ in range(times):
+                    dr, dc = self.r.choice(directions)
+                    row, col = self._coords[i]
+                    affected = 0
+                    for step in range(1, 6):
+                        target = coord_to_index.get((row + dr * step, col + dc * step))
+                        if target is not None:
+                            result[target] *= float(definition["prism"]); affected += 1
+                    if affected:
+                        self.emit("prism_type"); self.emit("adjacency", affected)
+        for i, source in enumerate(self._board):
+            script = self.catalog.ingredients[source.def_id].get("script")
+            if script == "collector":
+                result[i] += 2 * len({int(self.catalog.ingredients[x.def_id].get("rarity", 0)) for x in self._board})
+            elif script == "mimic_spirit":
+                neigh = self._neighbors(i)
+                if neigh:
+                    result[i] += max(result[n] for n in neigh)
+            elif script == "mirror":
+                row, col = self._coords[i]
+                opposite = (3 - row, 4 - col)
+                if opposite in coord_to_index:
+                    result[i] += result[coord_to_index[opposite]]
+            elif script == "pigment":
+                other = {self._board[n].def_id for n in self._neighbors(i)} & {"red_pigment","blue_pigment","yellow_pigment"}
+                other.discard(source.def_id)
+                if other:
+                    result[i] += 2; self.emit("adjacency")
+                if len(other) >= 2:
+                    result[i] += 2
+        flag_multipliers = [
+            ("cat_multiplier_spins", "cat", self.s.flags.get("cat_multiplier", 1)),
+            ("liquid_multiplier_spins", "liquid", self.s.flags.get("liquid_multiplier", 1)),
+            ("glass_multiplier_spins", "glass", self.s.flags.get("glass_multiplier", 1)),
+            ("mineral_multiplier_spins", "mineral", self.s.flags.get("mineral_multiplier", 1)),
+        ]
+        for flag, tag, multiplier in flag_multipliers:
+            if self.s.flags.get(flag, 0):
+                for i, inst in enumerate(self._board):
+                    tags = set(self.catalog.ingredients[inst.def_id].get("tags", []))
+                    if tag == "mineral" and tags.intersection({"stone","ore","metal"}) or tag in tags:
+                        result[i] *= float(multiplier)
+        if self.s.flags.get("global_multiplier_spins", 0):
+            result = [x * float(self.s.flags.get("global_multiplier", 1)) for x in result]
+        return [int(x) for x in result]
+
+    def _chance(self, chance: float, *, negative: bool = False) -> bool:
+        bonus = sum(float(self.catalog.items[x].get("chance_bonus", 0)) for x in self.s.items)
+        if negative:
+            bonus += sum(float(self.catalog.ingredients[x.def_id].get("global_modifier", {}).get("negative_chance", 0)) for x in self._board)
+            cancel = sum(float(self.catalog.items[x].get("negative_cancel_chance", 0)) for x in self.s.items)
+            if cancel and self.r.random() < min(1.0, cancel):
+                self.emit("negative_prevented")
+                return False
+        self.emit("chance_checked")
+        if self.s.flags.pop("guarantee_chance_next", False):
+            success = True
+        else:
+            success = self.r.random() < min(1.0, max(0.0, chance + bonus))
+        if negative and success:
+            self.emit("negative_triggered")
+        return success
+
+    def spin(self) -> int:
+        if self.s.status != "playing":
+            raise GameError("本局已经结束")
+        if self.s.pending:
+            raise GameError("请先处理当前选择")
+        self.s.last_log = []
+        self._round_events = defaultdict(int)
+        self._round_event_values = defaultdict(int)
+        self._removed_values = []
+        self.s.spin += 1
+        self.s.spins_left -= 1
+        self._coords = board_coords(self.s.expanded)
+        self._board = self.r.sample(self.s.ingredients, min(len(self.s.ingredients), len(self._coords)))
+        self._coords = self._coords[:len(self._board)]
+        for inst in self._board:
+            inst.age += 1
+            inst.counter += 1
+        self._panorama = "panorama_mirror" in self.s.items and self.s.spin % 3 == 0
+        if self._panorama:
+            self.emit("panorama")
+        self._all_adjacent = bool(
+            self.s.flags.get("all_adjacent_spins", 0)
+            or ("global_reaction_field" in self.s.items and self.s.spin % 3 == 0)
+        )
+        base_values = self._base_values()
+        self._values = self._apply_multipliers(base_values)
+        income = sum(self._values)
+        if "anomaly_recorder" in self.s.items:
+            if any(value >= int(self.catalog.ingredients[inst.def_id].get("base", 0)) * 3 and value > 0 for value, inst in zip(self._values, self._board)):
+                self._gain_gold(5, "异常记录仪"); self.emit("anomaly")
+        open_all_chests = bool(self.s.flags.pop("open_all_chests_next", False))
+        if "master_key" in self.s.items or open_all_chests:
+            force_open = open_all_chests
+            for i, inst in list(enumerate(self._board)):
+                if self._present(inst) and self._has_tag(inst, "chest") and (force_open or self._chance(0.3)):
+                    self._remove(inst, "opened", i)
+        for item_id in list(self.s.items):
+            item = self.catalog.items[item_id]
+            income += int(item.get("per_spin_gold", 0))
+            if item.get("script") == "reagent_rack":
+                income += 2 * sum(1 for x in self.s.items if x.endswith("_reagent"))
+            if item.get("script") == "impossible_container":
+                income += min(20, max(0, len(self.s.ingredients) - 20))
+            if item.get("script") == "automatic_stirrer" and self.s.spin % 10 == 0:
+                liquids = [x for x in self._board if self._present(x) and self._has_tag(x, "liquid")]
+                if liquids: self._permanent_bonus(self.r.choice(liquids), 1)
+            if item.get("script") == "goggles" and self.s.tokens.get("remove", 0) >= 3:
+                self._gain_token("remove", 1, "护目镜")
+            periodic = item.get("periodic_token")
+            if periodic and self.s.spin % int(periodic["every"]) == 0:
+                self._gain_token(periodic["token"], int(periodic["amount"]), item["name"])
+                if periodic["token"] == "essence": self.emit("distilled_essence")
+            periodic_choice = item.get("periodic_choice")
+            if periodic_choice and self.s.spin % int(periodic_choice["every"]) == 0:
+                for _ in range(int(periodic_choice.get("amount", 1))):
+                    self.s.pending.append(self.make_choice(periodic_choice["kind"], source=item_id))
+            choice_bonus = item.get("periodic_choice_bonus")
+            if choice_bonus and self.s.spin % int(choice_bonus["every"]) == 0:
+                self.s.flags["credit_card_bonus"] = int(choice_bonus["bonus"])
+        if self.s.flags.pop("double_next_income", False):
+            income *= 2
+            self.emit("ledger_used")
+        self._run_active_effects()
+        self._run_round_conditions(income)
+        if "coin_jar" in self.s.items and income <= 20:
+            income += 2
+            self.s.last_log.append("零钱罐：+2g。")
+        if self.s.flags.get("order_book_sacrifice"):
+            income = 0
+            self.s.flags.pop("order_book_sacrifice", None)
+            self.s.flags["order_book_reward"] = True
+            self.emit("order_book_used")
+        self.s.gold += income
+        self.s.stats["last_income"] = income
+        self.s.last_log.insert(0, f"第{self.s.spin}回合：成分与道具合计 {income:+d}g。")
+        self.s.last_board = [
+            {"slot": i + 1, "coord": list(self._coords[i]), "uid": inst.uid, "id": inst.def_id, "name": self.catalog.ingredients[inst.def_id]["name"], "value": self._values[i]}
+            for i, inst in enumerate(self._board)
+        ]
+        self._decay_flags()
+        interval = self.slag_interval(self.s.difficulty)
+        if interval and self.s.order_index < 11 and self.s.spin % interval == 0:
+            self.add_ingredient("slag")
+            self.s.last_log.append("难度规则向成分池加入1个废渣。")
+        if self.s.status == "playing":
+            self.s.pending.insert(0, self.make_choice("ingredient", source="spin", can_skip=not self.s.flags.pop("force_choose", False)))
+            if self.s.flags.get("extra_choice_spins", 0):
+                self.s.pending.append(self.make_choice("ingredient", source="essence"))
+            if self.s.spins_left <= 0:
+                self._settle_order()
+        self.check_essences()
+        self._sync_rng()
+        return income
+
+    def _decay_flags(self) -> None:
+        for key in ["all_adjacent_spins","cat_multiplier_spins","liquid_multiplier_spins","glass_multiplier_spins","mineral_multiplier_spins","global_multiplier_spins","extra_choice_spins"]:
+            if int(self.s.flags.get(key, 0)) > 0:
+                self.s.flags[key] = int(self.s.flags[key]) - 1
+
+    def _run_active_effects(self) -> None:
+        force_periodic = bool(self.s.flags.pop("force_periodic_next", False))
+        for i, inst in list(enumerate(self._board)):
+            if not self._present(inst):
+                continue
+            definition = self.catalog.ingredients[inst.def_id]
+            periodic = definition.get("periodic_gold")
+            if periodic:
+                every = self._effective_period(int(periodic["every"]))
+                if force_periodic or inst.counter >= every:
+                    self._gain_gold(int(periodic["gold"]), definition["name"])
+                    self._periodic_reset(inst, every); self.emit("periodic")
+            periodic_spawn = definition.get("periodic_spawn")
+            if periodic_spawn:
+                every = self._effective_period(int(periodic_spawn["every"]), spawning=True)
+                if force_periodic or inst.counter >= every:
+                    self._spawn_random(tag=periodic_spawn.get("tag"), source=i)
+                    self._periodic_reset(inst, every); self.emit("periodic")
+            if definition.get("spawn_each_spin"):
+                spec = definition["spawn_each_spin"]
+                self._spawn_random(tag=spec.get("tag"), def_id=spec.get("id"), source=i)
+            if definition.get("chance_spawn"):
+                spec = definition["chance_spawn"]
+                chance = float(spec["chance"]) + sum(float(self.catalog.items[x].get("spawn_chance_bonus", 0)) for x in self.s.items)
+                if self._chance(chance):
+                    self._spawn_random(tag=spec.get("tag"), rarity=spec.get("rarity"), def_id=spec.get("id"), source=i)
+            if definition.get("periodic_jackpot") and self._chance(float(definition["periodic_jackpot"]["chance"])):
+                self._gain_gold(int(definition["periodic_jackpot"]["gold"]), definition["name"])
+            if definition.get("stash"):
+                amount = int(definition["stash"]) + int(self.s.flags.get("monster_stash_bonus", 0))
+                inst.stored_gold += amount
+                self.emit("stored", value=amount)
+                if "storage_log" in self.s.items:
+                    used = self._round_event_values.get("storage_log_bonus", 0)
+                    if used < 3:
+                        bonus = min(1, 3 - used); self._gain_gold(bonus, "储藏记录"); self._round_event_values["storage_log_bonus"] += bonus
+            potion = definition.get("potion")
+            if potion:
+                self._trigger_potion(i, inst, potion)
+                continue
+            self._run_script(i, inst, definition.get("script"))
+            if not self._present(inst):
+                continue
+            transform = definition.get("chance_transform")
+            if transform and self._chance(float(transform["chance"])):
+                self._transform(inst, transform["into"])
+            transform_after = definition.get("transform_after")
+            if transform_after and inst.age >= int(transform_after["spins"]):
+                if not self._prevent_countdown(i, inst):
+                    self._transform(inst, transform_after["into"])
+            if definition.get("remove_after") and inst.age >= int(definition["remove_after"]):
+                if not self._prevent_countdown(i, inst):
+                    self._remove(inst, "expired", i)
+
+    def _effective_period(self, every: int, spawning: bool = False) -> int:
+        reduction = sum(int(self.catalog.items[x].get("counter_reduction", 0)) for x in self.s.items)
+        if spawning:
+            reduction += sum(int(self.catalog.items[x].get("spawn_period_reduction", 0)) for x in self.s.items)
+        return max(2, every - reduction)
+
+    def _periodic_reset(self, inst: IngredientInstance, every: int) -> None:
+        inst.counter = 0
+        if "time_rift" in self.s.items and self._chance(float(self.catalog.items["time_rift"]["time_rift_chance"])):
+            inst.counter = every - 1
+
+    def _run_script(self, index: int, inst: IngredientInstance, script: str | None) -> None:
+        if not script:
+            return
+        neighbors = [n for n in self._neighbors(index) if n < len(self._board) and self._present(self._board[n])]
+        if script == "kitten": self._consume_first(index, {"milk"}, 9)
+        elif script == "key": self._consume_first(index, tags={"chest"}, opened=True)
+        elif script == "alcohol_lamp":
+            if not self._consume_first(index, {"alcohol"}, 40): self._consume_first(index, {"oil"}, 15)
+        elif script == "acetone": self._consume_first(index, {"water"}, 9)
+        elif script == "growth_magic" and neighbors and self._chance(0.05): self._permanent_bonus(self._board[self.r.choice(neighbors)], 1)
+        elif script == "shovel": self._destroy_matching(index, tags={"grass"}, reward_each=7)
+        elif script == "pickaxe": self._pickaxe(index)
+        elif script == "sandpaper":
+            metals = [n for n in neighbors if self._has_tag(self._board[n], "metal")]
+            if metals:
+                self._permanent_bonus(self._board[self.r.choice(metals)], 1); self._remove(inst, "used", index)
+        elif script == "flame": self._flame(index)
+        elif script == "apprentice":
+            for n in list(neighbors):
+                target = self._board[n]
+                if self._has_tag(target, "glass") and self._chance(0.2): self._remove(target, "shattered", n, payout_multiplier=7)
+        elif script == "rust":
+            metals = [n for n in neighbors if self._has_tag(self._board[n], "metal")]
+            if metals and self._chance(0.1):
+                self._permanent_bonus(self._board[self.r.choice(metals)], -1); self._permanent_bonus(inst, 1)
+        elif script == "upgrade_magic" and inst.age >= 10:
+            self._transform(inst, self._draw_definition("ingredient", 2))
+        elif script == "easter_egg" and self._chance(0.1):
+            rarity = self.roll_rarity("ingredient")
+            self._transform(inst, self._draw_definition("ingredient", rarity))
+        elif script == "paper" and not inst.flags.get("grown") and self._chance(0.15):
+            self._permanent_bonus(inst, 1); inst.flags["grown"] = True
+        elif script == "herb":
+            herbs = [n for n in neighbors if self._board[n].def_id == "herb"]
+            if herbs:
+                other = self._board[herbs[0]]; self._remove(other, "combined", herbs[0]); self._remove(inst, "combined", index); self._spawn_random(tag="potion", source=index)
+        elif script == "mercenary":
+            targets = [n for n in neighbors if self._has_tag(self._board[n], "monster")]
+            if targets:
+                self._remove(self._board[targets[0]], "killed", targets[0]); self._gain_gold(10, "佣兵"); self._remove(inst, "used", index)
+        elif script == "warrior":
+            for n in list(neighbors):
+                target = self._board[n]
+                if self._present(target) and self._has_tag(target, "monster") and self._remove(target, "killed", n):
+                    self._permanent_bonus(inst, 1)
+        elif script == "one_time_growth":
+            threshold = int(self.catalog.ingredients[inst.def_id].get("growth_after", 10))
+            if inst.age >= threshold and not inst.flags.get("grown"):
+                self._permanent_bonus(inst, int(self.catalog.ingredients[inst.def_id].get("growth_amount", 1))); inst.flags["grown"] = True
+        elif script == "double_potion":
+            self._remove(inst, "potion", index)
+            self.emit("potion")
+        elif script == "copy_potion":
+            if neighbors:
+                copied = self._board[self.r.choice(neighbors)].def_id
+                self.add_ingredient(copied)
+                self.s.stats["recent_copied"] = copied
+                self.emit("copied")
+            self._remove(inst, "potion", index)
+            self.emit("potion")
+        elif script == "removal_magic" and not self.negative_disabled() and neighbors and self._chance(0.3, negative=True):
+            self._values[self.r.choice(neighbors)] = 0
+        elif script == "blank_magic" and not self.negative_disabled() and self._chance(0.3, negative=True): self.s.flags["blank_choice"] = True
+        elif script == "greed_magic" and not self.negative_disabled() and self._chance(0.3, negative=True): self.s.flags["force_choose"] = True
+        elif script == "alchemy_scrap":
+            removed = self._round_events.get("removed", 0)
+            seen = int(inst.flags.get(f"removed_seen:{self.s.spin}", 0))
+            if removed > seen:
+                self._permanent_bonus(inst, removed - seen)
+                inst.flags[f"removed_seen:{self.s.spin}"] = removed
+            if int(self.catalog.ingredients[inst.def_id]["base"]) + inst.permanent_bonus >= 5:
+                self._remove(inst, "used", index, fixed_payout=20)
+        elif script == "merchant" and inst.age % 10 == 0:
+            self._gain_gold(-5, "商人"); self.add_item(self._draw_definition("item", 1))
+        elif script == "pendulum":
+            if self.s.spin % 2: self._gain_gold(4, "钟摆")
+            if inst.age % 20 == 0: self._permanent_bonus(inst, 1)
+        elif script == "broken_flask" and self._chance(0.1): self._remove(inst, "shattered", index, fixed_payout=12)
+        elif script == "gambler":
+            coins = [self._board[n] for n in neighbors if self._board[n].def_id == "coin"]
+            if coins:
+                if any(x.flags.get("coin_success") for x in coins): self._permanent_bonus(inst, 1)
+                else: self._values[index] = 0
+        elif script == "gamble_stone":
+            roll = self.r.random(); self.emit("chance_checked")
+            if roll < 0.1: self._permanent_bonus(inst, 3)
+            elif roll < 0.2: inst.permanent_bonus = -int(self.catalog.ingredients[inst.def_id]["base"])
+        elif script == "reverse_gear":
+            for n in neighbors: self._board[n].counter = max(0, self._board[n].counter - 1)
+        elif script == "fast_gear":
+            for n in neighbors: self._board[n].counter += 1
+        elif script == "polishing_wheel" and inst.age % 8 == 0:
+            metals = [self._board[n] for n in neighbors if self._has_tag(self._board[n], "metal")]
+            if metals: self._permanent_bonus(self.r.choice(metals), 1)
+        elif script == "strengthening_elixir" and inst.age % 10 == 0 and neighbors: self._permanent_bonus(self._board[self.r.choice(neighbors)], 1)
+        elif script == "alcohol": self._alcohol(index, inst)
+        elif script == "golden_key": self._golden_key(index, inst)
+        elif script == "locksmith":
+            if self._consume_first(index, tags={"chest"}, reward=0, opened=True): self._permanent_bonus(inst, 1)
+        elif script in {"gardener","zookeeper","butcher","gem_merchant","arcane_beast"}: self._consumer_core(index, inst, script)
+        elif script == "lab_mouse" and self._round_events.get("potion", 0) and not inst.flags.get(f"potion:{self.s.spin}"):
+            self._permanent_bonus(inst, 1); inst.flags[f"potion:{self.s.spin}"] = True
+        elif script == "slime" and self._round_events.get("transformed", 0) and not inst.flags.get(f"transform:{self.s.spin}"):
+            self._permanent_bonus(inst, 1); inst.flags[f"transform:{self.s.spin}"] = True
+        elif script == "glassmaker" and self._round_events.get("shattered", 0):
+            seen = int(inst.flags.get(f"shatter_seen:{self.s.spin}", 0))
+            current = self._round_events.get("shattered", 0)
+            if current > seen:
+                self._permanent_bonus(inst, current - seen); inst.flags[f"shatter_seen:{self.s.spin}"] = current
+        elif script == "curse_vessel" and self._round_events.get("negative_triggered", 0) and not inst.flags.get(f"curse:{self.s.spin}"):
+            self._permanent_bonus(inst, 1); inst.flags[f"curse:{self.s.spin}"] = True
+        elif script == "repeater":
+            previous = self.s.stats.get("last_potion")
+            if previous and not inst.flags.get(f"repeat:{self.s.spin}"):
+                self._apply_potion_payload(previous, "复读机"); inst.flags[f"repeat:{self.s.spin}"] = True
+        elif script == "master_craftsman" and inst.age % 10 == 0:
+            for n in neighbors:
+                if self._has_tag(self._board[n], "equipment"): self._permanent_bonus(self._board[n], 1)
+        elif script == "vein" and inst.age % 5 == 0:
+            self._spawn_random(tag="ore", source=index); self._permanent_bonus(inst, 1); self.emit("periodic")
+        elif script == "super_bomb":
+            for n in list(neighbors): self._remove(self._board[n], "exploded", n, payout_multiplier=7)
+            self._remove(inst, "used", index)
+
+    def _consume_first(self, index: int, ids: set[str] | None = None, reward: int = 0, *, tags: set[str] | None = None, opened: bool = False) -> bool:
+        ids = ids or set(); tags = tags or set()
+        for n in self._neighbors(index):
+            target = self._board[n]
+            definition = self.catalog.ingredients[target.def_id]
+            if target.def_id in ids or set(definition.get("tags", [])).intersection(tags):
+                self._remove(target, "opened" if opened or "chest" in definition.get("tags", []) else "consumed", n)
+                if reward: self._gain_gold(reward, self.catalog.ingredients[self._board[index].def_id]["name"])
+                return True
+        return False
+
+    def _destroy_matching(self, index: int, tags: set[str], reward_each: int) -> int:
+        count = 0
+        for n in list(self._neighbors(index)):
+            if self._present(self._board[n]) and any(self._has_tag(self._board[n], tag) for tag in tags):
+                if self._remove(self._board[n], "removed", n): count += 1
+        if count: self._gain_gold(count * reward_each, self.catalog.ingredients[self._board[index].def_id]["name"])
+        return count
+
+    def _pickaxe(self, index: int) -> None:
+        for n in list(self._neighbors(index)):
+            target = self._board[n]
+            if self._present(target) and self._has_tag(target, "stone"):
+                gem = target.def_id == "gem_ore"
+                self._remove(target, "mined", n); self._gain_gold(10, "稿子")
+                if gem:
+                    for _ in range(3): self._spawn_random(tag="ore", minimum_rarity=2, source=index)
+                else: self._spawn_random(tag="metal", source=index)
+
+    def _flame(self, index: int) -> None:
+        for n in list(self._neighbors(index)):
+            target = self._board[n]
+            if not self._present(target): continue
+            if target.def_id == "alcohol":
+                self._remove(target, "burned", n); self._gain_gold(50, "火焰"); self.emit("burned")
+            elif self._has_tag(target, "wood"):
+                value = self._values[n] if n < len(self._values) else 0
+                self._remove(target, "burned", n); self._gain_gold(value * 10, "火焰"); self.add_ingredient("ash"); self.emit("burned")
+                for j in self._neighbors(index):
+                    if self._present(self._board[j]) and self._board[j].def_id == "furnace_core": self._permanent_bonus(self._board[j], 1)
+
+    def _alcohol(self, index: int, inst: IngredientInstance) -> None:
+        for n in list(self._neighbors(index)):
+            target = self._board[n]
+            if self._present(target) and (target.def_id in {"water","alcohol"} or self._has_tag(target, "organic_liquid")):
+                if self._remove(target, "consumed", n): self._permanent_bonus(inst, 1)
+
+    def _golden_key(self, index: int, inst: IngredientInstance) -> None:
+        for n in self._neighbors(index):
+            target = self._board[n]
+            if self._present(target) and self._has_tag(target, "chest"):
+                self._remove(target, "opened", n, payout_multiplier=2); self._remove(inst, "used", index); return
+
+    def _consumer_core(self, index: int, inst: IngredientInstance, script: str) -> None:
+        mapping = {
+            "gardener": ({"plant"}, set()), "zookeeper": ({"animal"}, set()), "butcher": ({"human"}, set()),
+            "gem_merchant": ({"ore","metal"}, set()), "arcane_beast": ({"magic"}, {"white_mage","witch"})}
+        tags, ids = mapping[script]
+        for n in list(self._neighbors(index)):
+            target = self._board[n]
+            if self._present(target) and (target.def_id in ids or any(self._has_tag(target, tag) for tag in tags)):
+                if target.uid != inst.uid and self._remove(target, "consumed", n): self._permanent_bonus(inst, 1)
+
+    def _trigger_potion(self, index: int, inst: IngredientInstance, potion: dict[str, Any]) -> None:
+        self._apply_potion_payload(potion, self.catalog.ingredients[inst.def_id]["name"])
+        self.s.stats["last_potion"] = dict(potion)
+        self._remove(inst, "potion", index); self.emit("potion")
+
+    def _apply_potion_payload(self, potion: dict[str, Any], source: str) -> None:
+        if potion.get("gold"): self._gain_gold(int(potion["gold"]), source)
+        if potion.get("token"): self._gain_token(potion["token"], int(potion.get("amount", 1)), source)
+        if potion.get("flag"): self.s.flags[potion["flag"]] = True
+        if potion.get("item_rarity"): self.add_item(self._draw_definition("item", int(potion["item_rarity"])))
+        if potion.get("recycle") and self.s.removed_history: self.add_ingredient(self.r.choice(self.s.removed_history))
+        if potion.get("purify"):
+            choices = [x for x in self.s.ingredients if int(self.catalog.ingredients[x.def_id].get("rarity", 0)) == 1]
+            if choices: self._remove(self.r.choice(choices), "purified", None)
+
+    def _spawn_random(self, *, tag: str | None = None, rarity: int | None = None, minimum_rarity: int = 1, def_id: str | None = None, source: int | None = None) -> IngredientInstance | None:
+        if def_id is None:
+            if rarity is None:
+                rarity = self.roll_rarity("ingredient", minimum=minimum_rarity)
+            def_id = self._draw_definition("ingredient", int(rarity), tag=tag)
+        created = self.add_ingredient(def_id)
+        if created:
+            self.emit("generated")
+            if source is not None:
+                for n in self._neighbors(source):
+                    target = self._board[n]
+                    if target.def_id == "proliferation_core" and not target.flags.get(f"proliferated:{self.s.spin}"):
+                        self._permanent_bonus(target, 1); target.flags[f"proliferated:{self.s.spin}"] = True
+            if "double_cauldron" in self.s.items and not self._round_events.get("double_cauldron"):
+                self._round_events["double_cauldron"] = 1; self._gain_gold(3, "双层坩埚")
+            if self.s.flags.pop("copy_next_generation", False):
+                self.add_ingredient(def_id); self.emit("copied")
+        return created
+
+    def _transform(self, inst: IngredientInstance, into: str) -> None:
+        old = inst.def_id
+        inst.def_id = into
+        inst.age = 0; inst.counter = 0; inst.flags = {}
+        self.emit("transformed")
+        try:
+            index = next(i for i, current in enumerate(self._board) if current.uid == inst.uid)
+        except StopIteration:
+            index = None
+        if index is not None:
+            for n in self._neighbors(index):
+                neighbor = self._board[n]
+                if self._present(neighbor) and neighbor.def_id == "alchemy_slime":
+                    self._permanent_bonus(neighbor, 1)
+        self.s.last_log.append(f"{self.catalog.ingredients[old]['name']}变化为{self.catalog.ingredients[into]['name']}。")
+
+    def _permanent_bonus(self, inst: IngredientInstance, amount: int) -> None:
+        inst.permanent_bonus += amount
+        self.emit("permanent_bonus")
+        if self._has_tag(inst, "liquid"): self.emit("liquid_permanent_bonus")
+        if "reaction_echo" in self.s.items and not self._round_events.get("reaction_echo"):
+            self._round_events["reaction_echo"] = 1
+            self._gain_gold(amount, "反应残响")
+
+    def _prevent_countdown(self, board_index: int, inst: IngredientInstance) -> bool:
+        if "preservative_box" in self.s.items and not inst.flags.get("preserved"):
+            inst.flags["preserved"] = True; inst.age = max(0, inst.age - 1); self._permanent_bonus(inst, 1); self.emit("countdown_prevented"); return True
+        return False
+
+    def _remove(self, inst: IngredientInstance, reason: str, board_index: int | None, *, payout_multiplier: int = 1, fixed_payout: int | None = None) -> bool:
+        if not self._present(inst): return False
+        if board_index is not None and reason in {"shattered","removed","consumed","killed","exploded","opened","burned"}:
+            for n in self._neighbors(board_index):
+                substitute = self._board[n]
+                if self._present(substitute) and substitute.def_id == "scapegoat" and substitute.uid != inst.uid and not substitute.flags.get(f"saved:{self.s.spin}"):
+                    substitute.flags[f"saved:{self.s.spin}"] = True
+                    self._remove(substitute, "sacrificed", n, fixed_payout=8)
+                    return False
+            for n in self._neighbors(board_index):
+                guard = self._board[n]
+                if self._present(guard) and guard.def_id == "restraint" and not guard.flags.get(f"guard:{self.s.spin}"):
+                    guard.flags[f"guard:{self.s.spin}"] = True; self._permanent_bonus(guard, 1); return False
+                expert = self.catalog.ingredients[guard.def_id]
+                aura = expert.get("aura", {})
+                if reason == "shattered" and aura.get("protect") == "shattered" and self._has_tag(inst, "equipment"): return False
+        definition = self.catalog.ingredients[inst.def_id]
+        if reason == "shattered" and "advanced_tube_rack" in self.s.items and not inst.flags.get("advanced_rack_saved"):
+            inst.flags["advanced_rack_saved"] = True
+            self.emit("shatter_prevented")
+            return False
+        for item_id in self.s.items:
+            protection = self.catalog.items[item_id].get("protect", {})
+            if reason == protection.get("reason") and (protection.get("id") == inst.def_id): return False
+        payout = fixed_payout if fixed_payout is not None else 0
+        if payout_multiplier > 1 and board_index is not None and board_index < len(self._values): payout += self._values[board_index] * payout_multiplier
+        if inst.stored_gold: payout += inst.stored_gold
+        on_removed = definition.get("on_removed", {})
+        if on_removed and on_removed.get("reason") in {"any", reason}:
+            payout += int(on_removed.get("gold", 0)) * payout_multiplier
+        self.s.ingredients = [x for x in self.s.ingredients if x.uid != inst.uid]
+        self.s.removed_history.append(inst.def_id)
+        self._removed_values.append((int(definition.get("rarity", 0)), int(definition.get("base", 0))))
+        if payout: self._gain_gold(payout, f"移除{definition['name']}")
+        self.emit("removed")
+        for tag in definition.get("tags", []): self.emit(f"removed_tag:{tag}")
+        if reason == "opened": self.emit("opened")
+        if reason == "shattered": self.emit("shattered")
+        if reason == "burned": self.emit("burned")
+        if reason == "potion": self.emit("potion")
+        if board_index is not None:
+            for n in self._neighbors(board_index):
+                neighbor = self._board[n]
+                if not self._present(neighbor):
+                    continue
+                if neighbor.def_id == "alchemy_scrap":
+                    self._permanent_bonus(neighbor, 1)
+                if reason == "shattered" and neighbor.def_id == "glassmaker":
+                    self._permanent_bonus(neighbor, 1)
+        if on_removed and on_removed.get("spawn_tag"): self._spawn_random(tag=on_removed["spawn_tag"])
+        if on_removed and on_removed.get("item_rarity"): self.add_item(self._draw_definition("item", int(on_removed["item_rarity"])))
+        if on_removed and on_removed.get("item_random"):
+            rarity = self.roll_rarity("item"); self.add_item(self._draw_definition("item", rarity))
+        if on_removed and on_removed.get("universal_chest"):
+            self.add_item(self._draw_definition("item", 3));
+            for token in ("remove","roll","essence"): self._gain_token(token, 1, "万能箱")
+        if inst.def_id == "nine_lives_cat" and int(inst.flags.get("lives", 8)) > 0:
+            new = self.add_ingredient("nine_lives_cat")
+            if new: new.flags["lives"] = int(inst.flags.get("lives", 8)) - 1
+        if "equivalent_exchange" in self.s.items and not self._round_events.get("equivalent_exchange"):
+            candidates = [x for x in self.s.ingredients if int(self.catalog.ingredients[x.def_id].get("rarity", 0)) == int(definition.get("rarity", 0))]
+            if candidates:
+                self._permanent_bonus(self.r.choice(candidates), int(definition.get("base", 0))); self._round_events["equivalent_exchange"] = 1
+        return True
+
+    def _gain_token(self, token: str, amount: int, source: str) -> None:
+        self.s.tokens[token] = int(self.s.tokens.get(token, 0)) + amount
+        self.emit("token", amount)
+        self.s.last_log.append(f"{source}：获得{amount}个{token} Token。")
+
+    def _run_round_conditions(self, income: int) -> None:
+        ids = [x.def_id for x in self._board]
+        tag_counts: Counter[str] = Counter(tag for x in self._board for tag in self.catalog.ingredients[x.def_id].get("tags", []))
+        for item_id in self.s.items:
+            condition = self.catalog.items[item_id].get("round_condition")
+            if not condition: continue
+            ok = True
+            if condition.get("event"): ok = self._round_events.get(condition["event"], 0) > 0
+            if condition.get("tag_count"): ok = tag_counts[condition["tag_count"]["tag"]] >= int(condition["tag_count"]["count"])
+            if condition.get("same_count"): ok = max(Counter(ids).values(), default=0) >= int(condition["same_count"])
+            if condition.get("all_unique"): ok = len(ids) == len(set(ids))
+            if condition.get("has_zero"): ok = any(v == 0 for v in self._values)
+            if condition.get("income_multiple"): ok = income % int(condition["income_multiple"]) == 0
+            if condition.get("income_even"): ok = income % 2 == 0
+            if condition.get("adjacent_same"): ok = self._has_adjacent_same(int(condition["adjacent_same"]))
+            if ok: self._gain_gold(int(condition.get("gold", 0)), self.catalog.items[item_id]["name"])
+
+    def _has_adjacent_same(self, count: int) -> bool:
+        for i, inst in enumerate(self._board):
+            same = 1 + sum(1 for n in self._neighbors(i) if self._board[n].def_id == inst.def_id)
+            if same >= count: return True
+        return False
+
+    def _settle_order(self) -> None:
+        amount, _ = self.current_order()
+        if self.s.gold < amount and "emergency_coffee" in self.s.items:
+            self.s.items.remove("emergency_coffee"); self.s.spins_left = 1; self.emit("coffee_used"); self.s.last_log.append("紧急咖啡提供了额外1回合。")
+            return
+        if self.s.gold < amount and "emergency_protocol" in self.s.items:
+            self.s.items.remove("emergency_protocol"); self.s.gold = amount; self.s.flags["next_order_penalty"] = True; self.emit("emergency_protocol_used")
+        if self.s.gold < amount:
+            self.s.status = "lost"; self.s.last_log.append(f"订单失败：需要{amount}g，当前只有{self.s.gold}g。")
+            return
+        self.s.gold -= amount
+        completed = self.s.order_index + 1
+        self.s.order_index = completed
+        self.emit("order_completed")
+        if "alchemy_bank" in self.s.items:
+            returned = int(float(self.s.stats.pop("bank_balance", 0)) * 1.5)
+            if returned:
+                self._gain_gold(returned, "炼金银行"); self.emit("bank_return", value=returned)
+            deposit = max(0, self.s.gold // 10)
+            if deposit:
+                self.s.gold -= deposit; self.s.stats["bank_balance"] = deposit
+                self.s.last_log.append(f"炼金银行存入{deposit}g。")
+        self.check_essences()
+        if "double_ledger" in self.s.items: self.s.flags["double_next_income"] = True
+        if completed >= 12: self.s.status = "won"
+        token_amount = 1 if self.s.difficulty >= 4 else 2
+        if completed >= 4 and completed % 2 == 0:
+            for token in ("remove","roll","essence"): self._gain_token(token, token_amount, "订单周期奖励")
+        self.s.pending.extend(self._order_rewards(completed))
+        essence_tokens = int(self.s.tokens.get("essence", 0))
+        self.s.tokens["essence"] = 0
+        for _ in range(essence_tokens):
+            choice = self.make_choice("essence", source="essence_token")
+            if choice.offers: self.s.pending.append(choice)
+        if self.s.status == "won":
+            self.s.last_log.append("已完成第12份订单：本局胜利。仍可查看状态与库存。")
+        else:
+            self.s.flags.pop("next_order_penalty", None)
+            _, spins = self.current_order()
+            self.s.spins_left = spins
+            self.s.last_log.append(f"完成第{completed}份订单，支付{amount}g。")
+
+    def _order_rewards(self, completed: int) -> list[PendingChoice]:
+        rewards: list[PendingChoice] = []
+        if completed <= 5: minimums = [2,2,2]
+        elif completed <= 8: minimums = [3]
+        elif completed == 9: minimums = [3,3]
+        else: minimums = [3,3,3]
+        rewards.append(self.make_choice("ingredient", minimums=minimums, source="order_guarantee"))
+        item_minimums = [3] if self.s.flags.pop("order_book_reward", False) else None
+        rewards.append(self.make_choice("item", minimums=item_minimums, source="order"))
+        return rewards
+
+    def choose(self, number: int) -> str:
+        if not self.s.pending: raise GameError("当前没有待选奖励")
+        choice = self.s.pending[0]
+        if not 1 <= number <= len(choice.offers): raise GameError("选择序号超出范围")
+        selected = choice.offers[number - 1]
+        self.s.pending.pop(0)
+        if choice.kind == "ingredient":
+            self.add_ingredient(selected)
+            self.emit("ingredient_chosen")
+            if choice.source in {"large_material_pack","giant_material_pack","alchemy_supply_pack"}: self.emit("pack_choice")
+            label = self.catalog.ingredients[selected]["name"]
+        elif choice.kind == "item":
+            self.add_item(selected); label = self.catalog.items[selected]["name"]
+        else:
+            self.add_essence(selected); label = self.catalog.essences[selected]["name"]
+        self.s.last_log = [f"选择了{label}。"] + self.s.last_log[-3:]
+        self.check_essences()
+        self._sync_rng()
+        return selected
+
+    def skip(self) -> None:
+        if not self.s.pending: raise GameError("当前没有待选奖励")
+        choice = self.s.pending[0]
+        if not choice.can_skip: raise GameError("本次选择不能跳过")
+        self.s.pending.pop(0)
+        self.emit(f"skip_{choice.kind}")
+        self.s.last_log = [f"跳过了{choice.kind}选择。"]
+        self.check_essences(); self._sync_rng()
+
+    def reroll(self) -> None:
+        if not self.s.pending: raise GameError("当前没有待选奖励")
+        if self.s.tokens.get("roll", 0) <= 0: raise GameError("没有Roll Token")
+        old = self.s.pending[0]
+        if old.kind == "essence": raise GameError("精粹选择不能重调")
+        self.s.tokens["roll"] -= 1; self.emit("token_spent"); self.emit("reroll")
+        new = self.make_choice(old.kind, count=len(old.offers), source=old.source, can_skip=old.can_skip)
+        if "lab_membership" in self.s.items:
+            attempts = 0
+            while set(new.offers) & set(old.offers) and attempts < 20:
+                new = self.make_choice(old.kind, count=len(old.offers), source=old.source, can_skip=old.can_skip); attempts += 1
+        self.s.pending[0] = new
+        self.s.last_log = ["消耗1个Roll Token，候选已重调。"]
+        self.check_essences(); self._sync_rng()
+
+    def remove(self, index: int) -> str:
+        if self.s.pending: raise GameError("请先处理当前选择")
+        if self.s.tokens.get("remove", 0) <= 0: raise GameError("没有删除Token")
+        if not 1 <= index <= len(self.s.ingredients): raise GameError("成分序号超出范围")
+        inst = self.s.ingredients[index - 1]
+        definition = self.catalog.ingredients[inst.def_id]
+        if not definition.get("removable", True): raise GameError(f"{definition['name']}不能主动删除")
+        self.s.tokens["remove"] -= 1; self.emit("token_spent")
+        self._remove(inst, "manual", None); self.emit("manual_removed")
+        if "warehouse_manager" in self.s.items:
+            rarity = int(definition.get("rarity", 0)); self._gain_gold(2 if rarity == 1 else (8 if rarity >= 3 else 0), "仓库管理员")
+        self.s.last_log = [f"删除了{definition['name']}。"]
+        self.check_essences(); self._sync_rng()
+        return inst.def_id
+
+    def use_item(self, item_id: str) -> None:
+        if item_id not in self.s.items: raise GameError("未持有该道具")
+        item = self.catalog.items[item_id]
+        active = item.get("active")
+        if not active: raise GameError("该道具没有主动效果")
+        if active.get("order_book"):
+            if self.s.spins_left != 1: raise GameError("幸运订单簿只能在订单剩余1回合时使用")
+            self.s.flags["order_book_sacrifice"] = True
+            self.s.last_log = ["幸运订单簿已准备：下一回合收益将被放弃。"]
+            self._sync_rng()
+            return
+        for _ in range(int(active.get("ingredient_choices", 0))): self.s.pending.append(self.make_choice("ingredient", source=item_id))
+        for rarity in active.get("fixed_ingredient_choices", []): self.s.pending.append(self.make_choice("ingredient", fixed_rarity=(None if int(rarity) == 0 else int(rarity)), source=item_id))
+        for _ in range(int(active.get("item_choices", 0))): self.s.pending.append(self.make_choice("item", source=item_id))
+        if active.get("consume"): self.s.items.remove(item_id)
+        self.s.last_log = [f"使用了{item['name']}。"]
+        self._sync_rng()
+
+    def check_essences(self) -> None:
+        for essence_id in list(self.s.essences):
+            data = self.catalog.essences[essence_id]
+            if self._trigger_ready(essence_id, data.get("trigger", {})):
+                self._apply_essence_effect(data.get("effect", {}), data["name"])
+                hits = self.s.stats.setdefault("essence_hits", {})
+                hits[essence_id] = int(hits.get(essence_id, 0)) + 1
+                uses = 2 if "essence_stabilizer" in self.s.items else 1
+                if hits[essence_id] >= uses:
+                    self.s.essences.remove(essence_id); self.s.consumed_essences.append(essence_id)
+                else:
+                    self.s.stats.setdefault("essence_baseline", {})[essence_id] = {
+                        "events": dict(self.s.stats.setdefault("event_counts", {})),
+                        "values": dict(self.s.stats.setdefault("event_values", {})),
+                        "spin": self.s.spin,
+                    }
+                    self.s.stats[f"essence_last_trigger:{essence_id}"] = self.s.spin
+                self.s.last_log.append(f"{data['name']}触发。")
+
+    def _trigger_ready(self, essence_id: str, trigger: dict[str, Any]) -> bool:
+        if self.s.stats.get(f"essence_last_trigger:{essence_id}") == self.s.spin:
+            return False
+        baseline = self.s.stats.setdefault("essence_baseline", {}).get(essence_id, {"events":{},"values":{},"spin":self.s.spin})
+        totals = self.s.stats.setdefault("event_counts", {})
+        values = self.s.stats.setdefault("event_values", {})
+        board_defs = [self.catalog.ingredients[x.def_id] for x in self._board if self._present(x)]
+        if "spins" in trigger and self.s.spin - int(baseline.get("spin", self.s.spin)) < int(trigger["spins"]): return False
+        if "event" in trigger and int(totals.get(trigger["event"], 0)) <= int(baseline.get("events", {}).get(trigger["event"], 0)): return False
+        if "event_count" in trigger:
+            spec=trigger["event_count"]; event=spec["event"]
+            if int(totals.get(event,0))-int(baseline.get("events",{}).get(event,0)) < int(spec["count"]): return False
+        if "event_count_round" in trigger:
+            spec=trigger["event_count_round"]
+            if self._round_events.get(spec["event"],0) < int(spec["count"]): return False
+        if "event_value" in trigger:
+            spec=trigger["event_value"]; event=spec["event"]
+            if int(values.get(event,0))-int(baseline.get("values",{}).get(event,0)) < int(spec["value"]): return False
+        if "round_events" in trigger and not all(self._round_events.get(x,0)>0 for x in trigger["round_events"]): return False
+        if "board_tag_count" in trigger:
+            spec=trigger["board_tag_count"]
+            if sum(1 for d in board_defs if spec["tag"] in d.get("tags",[])) < int(spec["count"]): return False
+        if "board_filter_count" in trigger:
+            spec=trigger["board_filter_count"]; tags=set(spec.get("tags",[]))
+            found=sum(1 for d in board_defs if (not tags or tags.intersection(d.get("tags",[]))) and (not spec.get("rarity") or int(d.get("rarity",0))==int(spec["rarity"])))
+            if found < int(spec["count"]): return False
+        if "board_base_zero" in trigger and sum(1 for d in board_defs if int(d.get("base",0))==0) < int(trigger["board_base_zero"]): return False
+        if "board_same_count" in trigger and max(Counter(d["id"] for d in board_defs).values(), default=0) < int(trigger["board_same_count"]): return False
+        if trigger.get("board_all_unique") and len(board_defs) != len({d["id"] for d in board_defs}): return False
+        if "board_adjacent_same" in trigger and not self._has_adjacent_same(int(trigger["board_adjacent_same"])): return False
+        income=int(self.s.stats.get("last_income",0))
+        if "income_max" in trigger and income > int(trigger["income_max"]): return False
+        if trigger.get("income_even") and income % 2: return False
+        if "income_multiple" in trigger and income % int(trigger["income_multiple"]): return False
+        if "token_count" in trigger:
+            spec=trigger["token_count"]
+            if int(self.s.tokens.get(spec["token"],0)) < int(spec["count"]): return False
+        if "pool_size" in trigger and len(self.s.ingredients) < int(trigger["pool_size"]): return False
+        if "essence_count" in trigger and len(self.s.essences) < int(trigger["essence_count"]): return False
+        if "choice_offers" in trigger and (not self.s.pending or len(self.s.pending[0].offers) < int(trigger["choice_offers"])): return False
+        if "choice_contains_rarities" in trigger:
+            if not set(trigger["choice_contains_rarities"]).issubset(set(self.s.stats.get("last_choice_rarities",[]))): return False
+        if "owned_item_prefix" in trigger:
+            spec=trigger["owned_item_prefix"]
+            if sum(1 for x in self.s.items if x.endswith("_reagent")) < int(spec["count"]): return False
+        return bool(trigger)
+
+    def _apply_essence_effect(self, effect: dict[str, Any], source: str) -> None:
+        if effect.get("gold"): self._gain_gold(int(effect["gold"]), source)
+        for token, amount in effect.get("tokens", {}).items(): self._gain_token(token, int(amount), source)
+        if effect.get("rarity_multiplier"): self.s.rarity_multiplier *= float(effect["rarity_multiplier"])
+        if effect.get("flag"): self.s.flags.update(effect["flag"])
+        if effect.get("permanent_bonus"):
+            spec=effect["permanent_bonus"]
+            for inst in self.s.ingredients:
+                definition=self.catalog.ingredients[inst.def_id]; tags=set(definition.get("tags",[]))
+                matches=spec.get("tag") in tags or bool(tags.intersection(spec.get("tags",[]))) or ("base" in spec and int(definition.get("base",0))==int(spec["base"]))
+                if spec.get("rarity") and int(definition.get("rarity",0))!=int(spec["rarity"]): matches=False
+                if matches: self._permanent_bonus(inst,int(spec["amount"]))
+        if effect.get("random_permanent_bonus") and self.s.ingredients: self._permanent_bonus(self.r.choice(self.s.ingredients),int(effect["random_permanent_bonus"]))
+        if effect.get("add_ingredient"):
+            spec=effect["add_ingredient"]; rarity=int(spec.get("rarity") or self.roll_rarity("ingredient")); self.add_ingredient(self._draw_definition("ingredient",rarity,tag=spec.get("tag")))
+        if effect.get("fixed_choice"):
+            spec=effect["fixed_choice"]; self.s.pending.append(self.make_choice(spec["kind"],fixed_rarity=int(spec["rarity"]),source="essence"))
+        if effect.get("copy_recent") and self.s.stats.get("recent_copied"): self.add_ingredient(self.s.stats["recent_copied"])
+        if effect.get("remove_random_rarity"):
+            spec=effect["remove_random_rarity"]; candidates=[x for x in self.s.ingredients if int(self.catalog.ingredients[x.def_id].get("rarity",0))==int(spec["rarity"])]
+            for inst in self.r.sample(candidates,min(len(candidates),int(spec["count"]))): self._remove(inst,"essence",None)
+        if effect.get("highest_removed_to_random") and self._removed_values and self.s.ingredients:
+            self._permanent_bonus(self.r.choice(self.s.ingredients),max(v for _,v in self._removed_values))
+        if effect.get("advance_random_essences"):
+            others=[x for x in self.s.essences if self.catalog.essences[x]["name"] != source]
+            for essence_id in self.r.sample(others,min(len(others),int(effect["advance_random_essences"]))): self.s.stats.setdefault("essence_hits",{})[essence_id]=1
+
+    def status_payload(self) -> dict[str, Any]:
+        amount, total_spins = self.current_order()
+        choice = self.s.pending[0] if self.s.pending else None
+        return {
+            "status": self.s.status, "seed": self.s.seed, "difficulty": self.s.difficulty,
+            "gold": self.s.gold, "spin": self.s.spin,
+            "order": self.s.order_index + 1, "order_amount": amount,
+            "spins_left": self.s.spins_left, "order_spins": total_spins,
+            "pool_size": len(self.s.ingredients), "board_capacity": 21 if self.s.expanded else 20,
+            "tokens": dict(self.s.tokens), "items": list(self.s.items), "essences": list(self.s.essences),
+            "pending": None if not choice else {"kind":choice.kind,"offers":list(choice.offers),"can_skip":choice.can_skip,"source":choice.source},
+            "last_board": list(self.s.last_board), "last_log": list(self.s.last_log),
+        }
