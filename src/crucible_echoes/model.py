@@ -66,5 +66,7 @@ class GameState:
         copied = dict(data)
         copied["ingredients"] = [IngredientInstance.from_dict(x) for x in copied.get("ingredients", [])]
         copied["pending"] = [PendingChoice.from_dict(x) for x in copied.get("pending", [])]
+        stats = dict(copied.get("stats") or {})
+        stats.setdefault("spawn_counters", {})
+        copied["stats"] = stats
         return cls(**copied)
-

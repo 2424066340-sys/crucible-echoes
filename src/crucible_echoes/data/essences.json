@@ -97,6 +97,7 @@
   {"id":"essence_stabilizer_essence","item_id":"essence_stabilizer","name":"精粹稳定剂精粹","description":"同时持有5个未触发精粹时，使随机3个视为完成一次条件。","trigger":{"essence_count":5},"effect":{"advance_random_essences":3}},
   {"id":"global_reaction_field_essence","item_id":"global_reaction_field","name":"全域反应场精粹","description":"同回合发生8次相邻效果时，接下来2回合全体彼此相邻。","trigger":{"event_count_round":{"event":"adjacency","count":8}},"effect":{"flag":{"all_adjacent_spins":2}}},
   {"id":"equivalent_exchange_essence","item_id":"equivalent_exchange","name":"等价交换法则精粹","description":"单回合移除至少4个成分时，把最高基础价值永久赋给随机成分。","trigger":{"event_count_round":{"event":"removed","count":4}},"effect":{"highest_removed_to_random":true}},
-  {"id":"impossible_container_essence","item_id":"impossible_container","name":"不可能容器精粹","description":"成分池达到35时获得100g并随机移除5个1级成分。","trigger":{"pool_size":35},"effect":{"gold":100,"remove_random_rarity":{"rarity":1,"count":5}}},
+  {"id":"impossible_container_essence","item_id":"impossible_container","name":"不可能容器精粹","description":"成分池达到35时获得75g并随机移除5个1级成分。","trigger":{"pool_size":35},"effect":{"gold":75,"remove_random_rarity":{"rarity":1,"count":5}}},
+  {"id":"monster_guide_essence","item_id":"monster_guide","name":"怪物指南精粹","description":"累计移除3个怪物：+30g，获得1个删除Token，然后消耗。","trigger":{"event_count":{"event":"removed_tag:monster","count":3}},"effect":{"gold":30,"tokens":{"remove":1}}},
   {"id":"time_rift_essence","item_id":"time_rift","name":"时间裂缝精粹","description":"同回合触发4个周期效果时，使下一回合所有周期效果立即触发。","trigger":{"event_count_round":{"event":"periodic","count":4}},"effect":{"flag":{"force_periodic_next":true}}}
 ]

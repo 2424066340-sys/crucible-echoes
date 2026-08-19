@@ -13,6 +13,9 @@ class GameError(RuntimeError):
     pass
 
 
+MINERAL_TAGS = frozenset({"stone", "ore", "metal"})
+
+
 class GameEngine:
     def __init__(self, catalog: Catalog | None = None):
         self.catalog = catalog or Catalog.load()
@@ -43,7 +46,14 @@ class GameEngine:
             order_index=0,
             spins_left=first[1],
             next_uid=1,
-            stats={"event_counts": {}, "event_values": {}, "essence_baseline": {}, "essence_hits": {}, "seen_types": []},
+            stats={
+                "event_counts": {},
+                "event_values": {},
+                "essence_baseline": {},
+                "essence_hits": {},
+                "seen_types": [],
+                "spawn_counters": {},
+            },
         )
         self.state = state
         for def_id in self.catalog.progression["initial_ingredients"]:
@@ -56,6 +66,15 @@ class GameEngine:
 
     def bind(self, state: GameState) -> "GameEngine":
         self.state = state
+        # Older saves predate the generic generation counters.  Keep the
+        # counters inside the existing stats object so no new required JSON
+        # dataclass field is introduced.
+        self.s.stats.setdefault("spawn_counters", {})
+        self.s.stats.setdefault("event_counts", {})
+        self.s.stats.setdefault("event_values", {})
+        self.s.stats.setdefault("essence_baseline", {})
+        self.s.stats.setdefault("essence_hits", {})
+        self.s.stats.setdefault("seen_types", [])
         self.rng = DeterministicRNG(state.rng_state)
         return self
 
@@ -176,13 +195,30 @@ class GameEngine:
 
     def _draw_definition(self, kind: str, rarity: int, *, tag: str | None = None, exclude: set[str] | None = None) -> str:
         rows = self._defs_at_rarity(kind, rarity, tag=tag, exclude=exclude)
-        if not rows and tag:
-            rows = self._defs_at_rarity(kind, rarity, exclude=exclude)
         if not rows:
             for fallback in range(rarity - 1, 0, -1):
                 rows = self._defs_at_rarity(kind, fallback, tag=tag, exclude=exclude)
                 if rows:
                     break
+        if not rows:
+            # Some tagged families intentionally have no definitions at every
+            # rarity (for example, the ore tag starts at rarity 2). Preserve
+            # the requested minimum by falling upward before failing.
+            for fallback in range(rarity + 1, 5):
+                rows = self._defs_at_rarity(kind, fallback, tag=tag, exclude=exclude)
+                if rows:
+                    break
+        if not rows and tag:
+            # Only leave the requested tag family as a last resort.  This is
+            # needed for families that have no definitions at any rarity, but
+            # must not turn an ore generation into an unrelated special card
+            # just because the weighted rarity landed on an empty tier.
+            rows = self._defs_at_rarity(kind, rarity, exclude=exclude)
+            if not rows:
+                for fallback in list(range(rarity - 1, 0, -1)) + list(range(rarity + 1, 5)):
+                    rows = self._defs_at_rarity(kind, fallback, exclude=exclude)
+                    if rows:
+                        break
         if not rows:
             raise GameError(f"{kind}池中没有可抽取定义")
         return self.r.weighted_choice([(row["id"], float(row.get("pool_weight", 1.0))) for row in rows])
@@ -570,6 +606,7 @@ class GameEngine:
             income *= 2
             self.emit("ledger_used")
         self._run_active_effects()
+        self._run_item_round_effects()
         self._run_round_conditions(income)
         if "coin_jar" in self.s.items and income <= 20:
             income += 2
@@ -622,7 +659,14 @@ class GameEngine:
             if periodic_spawn:
                 every = self._effective_period(int(periodic_spawn["every"]), spawning=True)
                 if force_periodic or inst.counter >= every:
-                    self._spawn_random(tag=periodic_spawn.get("tag"), source=i)
+                    self._spawn_random(
+                        tag=periodic_spawn.get("tag"),
+                        source=i,
+                        minimum_rarity=int(periodic_spawn.get("minimum_rarity", 1)),
+                        minimum_rarity_chance=periodic_spawn.get("minimum_rarity_chance"),
+                    )
+                    if periodic_spawn.get("permanent_bonus"):
+                        self._permanent_bonus(inst, int(periodic_spawn["permanent_bonus"]))
                     self._periodic_reset(inst, every); self.emit("periodic")
             if definition.get("spawn_each_spin"):
                 spec = definition["spawn_each_spin"]
@@ -631,7 +675,24 @@ class GameEngine:
                 spec = definition["chance_spawn"]
                 chance = float(spec["chance"]) + sum(float(self.catalog.items[x].get("spawn_chance_bonus", 0)) for x in self.s.items)
                 if self._chance(chance):
-                    self._spawn_random(tag=spec.get("tag"), rarity=spec.get("rarity"), def_id=spec.get("id"), source=i)
+                    guarantee = spec.get("success_guarantee", {})
+                    counter_name = guarantee.get("counter")
+                    counters = self.s.stats.setdefault("spawn_counters", {})
+                    previous_successes = int(counters.get(counter_name, 0)) if counter_name else 0
+                    guarantee_active = bool(
+                        counter_name
+                        and previous_successes >= int(guarantee.get("every", 0))
+                    )
+                    minimum_rarity = int(guarantee.get("minimum_rarity", 1)) if guarantee_active else 1
+                    created = self._spawn_random(
+                        tag=spec.get("tag"),
+                        rarity=spec.get("rarity"),
+                        minimum_rarity=minimum_rarity,
+                        def_id=spec.get("id"),
+                        source=i,
+                    )
+                    if created and counter_name:
+                        counters[counter_name] = 0 if guarantee_active else previous_successes + 1
             if definition.get("periodic_jackpot") and self._chance(float(definition["periodic_jackpot"]["chance"])):
                 self._gain_gold(int(definition["periodic_jackpot"]["gold"]), definition["name"])
             if definition.get("stash"):
@@ -659,6 +720,27 @@ class GameEngine:
             if definition.get("remove_after") and inst.age >= int(definition["remove_after"]):
                 if not self._prevent_countdown(i, inst):
                     self._remove(inst, "expired", i)
+
+    def _run_item_round_effects(self) -> None:
+        """Apply declarative item effects that inspect the settled board.
+
+        Each target is checked independently and only while it is still in the
+        pool, so earlier removals in the same pass naturally prevent a second
+        check of an already departed instance.
+        """
+        for item_id in list(self.s.items):
+            effect = self.catalog.items[item_id].get("round_effect", {})
+            remove_rule = effect.get("remove_tag_chance")
+            if not remove_rule:
+                continue
+            tag = remove_rule.get("tag")
+            chance = float(remove_rule.get("chance", 0.0))
+            reason = str(remove_rule.get("reason", "removed"))
+            for board_index, target in list(enumerate(self._board)):
+                if not self._present(target) or not self._has_tag(target, tag):
+                    continue
+                if self.r.random() < chance:
+                    self._remove(target, reason, board_index)
 
     def _effective_period(self, every: int, spawning: bool = False) -> int:
         reduction = sum(int(self.catalog.items[x].get("counter_reduction", 0)) for x in self.s.items)
@@ -873,13 +955,91 @@ class GameEngine:
             choices = [x for x in self.s.ingredients if int(self.catalog.ingredients[x.def_id].get("rarity", 0)) == 1]
             if choices: self._remove(self.r.choice(choices), "purified", None)
 
-    def _spawn_random(self, *, tag: str | None = None, rarity: int | None = None, minimum_rarity: int = 1, def_id: str | None = None, source: int | None = None) -> IngredientInstance | None:
+    @staticmethod
+    def _as_rule_list(value: Any) -> list[dict[str, Any]]:
+        if not value:
+            return []
+        if isinstance(value, dict):
+            return [value]
+        return [row for row in value if isinstance(row, dict)]
+
+    def _spawn_is_mineral(self, tag: str | None, def_id: str | None) -> bool:
+        if tag in MINERAL_TAGS:
+            return True
+        if def_id and def_id in self.catalog.ingredients:
+            return bool(MINERAL_TAGS.intersection(self.catalog.ingredients[def_id].get("tags", [])))
+        return False
+
+    def _spawn_minimum_from_items(
+        self,
+        *,
+        tag: str | None,
+        def_id: str | None,
+        minimum_rarity: int,
+    ) -> tuple[int, list[str]]:
+        """Combine declarative item minimums for one successful spawn.
+
+        The returned keys are marked only after ``add_ingredient`` succeeds,
+        which keeps once-per-round guarantees from being consumed by failed
+        unique/duplicate generation attempts.
+        """
+        if not self._spawn_is_mineral(tag, def_id):
+            return int(minimum_rarity), []
+        effective = int(minimum_rarity)
+        once_keys: list[str] = []
+        for item_id in self.s.items:
+            rules = self._as_rule_list(self.catalog.items[item_id].get("spawn_minimum_rarity"))
+            for rule_index, rule in enumerate(rules):
+                target_tags = set(rule.get("tags", []))
+                actual_tags = set(self.catalog.ingredients[def_id].get("tags", [])) if def_id else set()
+                if target_tags:
+                    if tag not in target_tags and not target_tags.intersection(actual_tags):
+                        continue
+                if rule.get("tag") and rule["tag"] != tag and rule["tag"] not in actual_tags:
+                    continue
+                key = f"spawn_minimum:{item_id}:{rule_index}"
+                if rule.get("once_per_round") and self._round_events.get(key):
+                    continue
+                effective = max(effective, int(rule.get("minimum", 1)))
+                if rule.get("once_per_round"):
+                    once_keys.append(key)
+        return effective, once_keys
+
+    def _spawn_random(
+        self,
+        *,
+        tag: str | None = None,
+        rarity: int | None = None,
+        minimum_rarity: int = 1,
+        minimum_rarity_chance: dict[str, Any] | None = None,
+        def_id: str | None = None,
+        source: int | None = None,
+    ) -> IngredientInstance | None:
+        effective_minimum, once_keys = self._spawn_minimum_from_items(
+            tag=tag,
+            def_id=def_id,
+            minimum_rarity=minimum_rarity,
+        )
+        # A stronger deterministic minimum makes a weaker probabilistic
+        # minimum redundant.  Skipping that redundant roll also prevents a
+        # table + vein combination from adding an extra RNG event.
+        if minimum_rarity_chance:
+            chance_minimum = int(minimum_rarity_chance.get("minimum", 1))
+            chance = float(minimum_rarity_chance.get("chance", 0.0))
+            if effective_minimum < chance_minimum and self.r.random() < chance:
+                effective_minimum = chance_minimum
         if def_id is None:
-            if rarity is None:
-                rarity = self.roll_rarity("ingredient", minimum=minimum_rarity)
+            if rarity is None or int(rarity) < effective_minimum:
+                rarity = self.roll_rarity("ingredient", minimum=effective_minimum)
             def_id = self._draw_definition("ingredient", int(rarity), tag=tag)
+        elif effective_minimum > int(self.catalog.ingredients[def_id].get("rarity", 0)):
+            # An explicit low-rarity mineral cannot violate a stronger
+            # generated minimum; draw another definition in the same family.
+            def_id = self._draw_definition("ingredient", effective_minimum, tag=tag)
         created = self.add_ingredient(def_id)
         if created:
+            for key in once_keys:
+                self._round_events[key] = 1
             self.emit("generated")
             if source is not None:
                 for n in self._neighbors(source):
@@ -997,16 +1157,22 @@ class GameEngine:
         for item_id in self.s.items:
             condition = self.catalog.items[item_id].get("round_condition")
             if not condition: continue
+            once_key = f"round_condition:{item_id}"
+            if self._round_events.get(once_key):
+                continue
             ok = True
             if condition.get("event"): ok = self._round_events.get(condition["event"], 0) > 0
             if condition.get("tag_count"): ok = tag_counts[condition["tag_count"]["tag"]] >= int(condition["tag_count"]["count"])
+            if condition.get("pool_size") is not None: ok = len(self.s.ingredients) >= int(condition["pool_size"])
             if condition.get("same_count"): ok = max(Counter(ids).values(), default=0) >= int(condition["same_count"])
             if condition.get("all_unique"): ok = len(ids) == len(set(ids))
             if condition.get("has_zero"): ok = any(v == 0 for v in self._values)
             if condition.get("income_multiple"): ok = income % int(condition["income_multiple"]) == 0
             if condition.get("income_even"): ok = income % 2 == 0
             if condition.get("adjacent_same"): ok = self._has_adjacent_same(int(condition["adjacent_same"]))
-            if ok: self._gain_gold(int(condition.get("gold", 0)), self.catalog.items[item_id]["name"])
+            if ok:
+                self._round_events[once_key] = 1
+                self._gain_gold(int(condition.get("gold", 0)), self.catalog.items[item_id]["name"])
 
     def _has_adjacent_same(self, count: int) -> bool:
         for i, inst in enumerate(self._board):
@@ -1406,6 +1572,7 @@ class GameEngine:
                 "rarity_multiplier": state.rarity_multiplier,
                 "flags": dict(state.flags),
                 "stats": state.stats,
+                "spawn_counters": dict(state.stats.setdefault("spawn_counters", {})),
                 "last_board": list(state.last_board),
                 "last_log": list(state.last_log),
                 "available_actions": self.agent_available_actions(),

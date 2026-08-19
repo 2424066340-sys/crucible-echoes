@@ -1,220 +1,40 @@
 # 坩埚余响 · Crucible Echoes
 
-一个**可复现、可存档、数据驱动**的纯文字炼金构筑 roguelike。
+> 想让 AI 开始玩吗？把这个项目文件夹交给一个能运行终端的 AI，然后告诉它：“请阅读 README，使用 `agent` 接口自己开一局，一直玩到胜利或失败。”
 
-你将不断扩充实验池。每回合，游戏会从池中随机抽取最多 20 个成分并铺入实验台，随后结算邻接、消耗、变化、生成、永久成长等效果。你的目标是在有限回合内完成越来越昂贵的炼金订单，并最终完成第 12 份订单。
+一个**可复现、可存档、数据驱动**的纯文字炼金构筑 roguelike。你会不断扩充成分池，在 4×5 实验台上结算邻接、生成、变化、移除和永久成长效果，并在有限回合内完成越来越昂贵的炼金订单。
 
-项目不包含任何第三方游戏的美术、文本、代码或品牌素材。全部名称、说明与实现均为本项目原创内容。项目采用 MIT License，详见 [LICENSE](https://github.com/2424066340-sys/crucible-echoes/blob/main/LICENSE)。
+项目不包含任何第三方游戏的美术、文本、代码或品牌素材。项目名称、规则文案与实现均为本项目内容。项目采用 [MIT License](LICENSE)。
 
+## 特性
 
-# 怎么让你的 AI 玩《坩埚余响》
-
-《坩埚余响》已经提供专门的 **AI Agent 接口**。如果你的 AI 能执行终端命令，就可以让它自己开局、读取游戏状态、做决定并一直玩到结束。
-
-## 1. 先下载游戏
-
-打开项目地址：
-
-https://github.com/2424066340-sys/crucible-echoes
-
-点击：
-
-**Code → Download ZIP**
-
-解压后进入项目文件夹。
-
-需要：
-
-* Python 3.10+
-* 不需要安装第三方依赖
-
-## 2. 把项目交给你的 AI
-
-适合直接游玩的 AI，一般是能够操作终端或运行代码的 Agent，例如：
-
-* Claude Code
-* OpenAI Codex
-* Gemini CLI
-* 其他能够执行本地命令的 AI Agent
-
-把整个项目文件夹交给它，然后直接告诉它：
-
-> 阅读 README，使用 `agent` 接口自己开一局《坩埚余响》。始终使用同一个存档路径，每一步读取 `[STATE]` 后根据 `available_actions` 自己决定下一步，一直玩到胜利或失败。不要直接修改存档文件。
-
-然后人类就可以搬个椅子坐旁边看了。
-
-## 3. AI 实际上会怎么操作
-
-AI 首先创建一局游戏：
-
-```bash
-python game.py agent new --seed 42 --difficulty 1 --save .saves/ai.json
-```
-
-游戏会返回一行：
-
-```text
-[STATE] {"protocol":"crucible-echoes-agent/v1", ...}
-```
-
-这里包含当前完整游戏状态，以及 AI 下一步可以执行的操作。
-
-例如 AI 看到可以旋转，就会执行：
-
-```bash
-python game.py agent spin --save .saves/ai.json
-```
-
-出现成分候选后，它可能选择第 2 个：
-
-```bash
-python game.py agent choose 2 --save .saves/ai.json
-```
-
-然后继续：
-
-```bash
-python game.py agent spin --save .saves/ai.json
-```
-
-整个过程就是：
-
-**读取状态 → 自己思考 → 执行一个动作 → 读取新状态 → 再思考**
-
-一直循环到本局结束。
-
-## 4. AI 可以执行哪些操作
-
-目前支持：
-
-```text
-new
-status
-spin
-choose N
-skip
-reroll
-remove N
-inventory
-use ITEM_ID
-help
-```
-
-例如：
-
-```bash
-python game.py agent inventory --save .saves/ai.json
-```
-
-查看完整库存。
-
-```bash
-python game.py agent reroll --save .saves/ai.json
-```
-
-使用 Roll Token 重调当前候选。
-
-```bash
-python game.py agent remove 7 --save .saves/ai.json
-```
-
-移除库存中的第 7 个成分。
-
-AI 不需要自己猜哪些操作合法，因为 `[STATE]` 中会提供：
-
-```text
-available_actions
-available_action_specs
-```
-
-让它知道当前真正可以做什么。
-
-## 5. 最重要的一件事：一直使用同一个存档
-
-同一局游戏必须始终使用同一个：
-
-```text
---save .saves/ai.json
-```
-
-例如不要上一回合用：
-
-```text
-.saves/ai.json
-```
-
-下一回合突然换成：
-
-```text
-.saves/test.json
-```
-
-否则那已经是另一份游戏状态了。
-
-《坩埚余响》的随机数状态也保存在存档中，因此：
-
-**相同 seed + 相同操作序列 = 相同结果。**
-
-AI 不能靠反复重启程序偷偷刷新随机结果。
-
-## 6. 如果 AI 不知道该怎么玩
-
-可以直接把下面这段发给它：
-
-> 你现在要独立游玩《坩埚余响》。请先阅读项目 README，然后只使用 `python game.py agent ...` 接口进行游戏。创建一局后始终使用同一个 save 文件。每次命令执行后读取 `[STATE]` JSON，分析当前订单、金币、实验池、候选、道具、精粹、最近盘面和 `available_actions`，自行选择你认为最优的下一步。一次只执行一个动作，不要直接编辑存档，不要让我替你做决定，并持续游玩直到胜利或失败。过程中可以向我解释你的构筑思路和重要决策。
-
-这样它通常就能自己开始。
-
-## 7. 普通聊天 AI 能直接玩吗？
-
-如果只是普通网页聊天窗口，而且它：
-
-* 不能执行终端命令
-* 不能访问你的本地文件
-* 没有连接相应工具
-
-那么目前不能完全自动游玩。
-
-你仍然可以把每一步 `[STATE]` 发给它，让它决定下一步，然后由你帮它执行命令。
-
-也就是说，人类暂时会变成一个性能稳定但接口设计十分古老的 MCP。
-
-等《坩埚余响》的 MCP 版本完成后，这类 AI 也可以直接通过工具自己操作游戏，不需要人类来回复制命令。
-
-## 一句话版本
-
-把项目下载下来，交给一个能运行终端的 AI，然后告诉它：
-
-> **“读 README，用 agent 接口自己开一局，一直玩到结束。”**
-
-剩下的就让它自己炼。🧪
-
-
-
+- 纯文字 CLI，同时支持人类交互和 AI Agent 单步操作。
+- 固定 seed 与存档中的 RNG 状态保证结果可复现。
+- JSON 存档，可暂停、恢复和迁移旧存档。
+- 成分、道具、精粹、订单和难度规则均由 JSON 数据驱动。
+- Agent 每次进程只执行一个动作，并输出统一的 `[STATE]` JSON。
 
 ## 快速开始
 
 需要 Python 3.10 或更高版本，不依赖第三方包。
+
+### 人类交互模式
 
 ```bash
 python game.py new --seed 42 --difficulty 1
 python game.py start
 ```
 
-Windows 也可以使用：
+Windows PowerShell 也可以使用：
 
 ```powershell
 py -3 game.py new --seed 42 --difficulty 1
 py -3 game.py start
 ```
 
-默认存档位于：
+默认存档位于 `.saves/current.json`。如需使用其他存档，在命令末尾添加 `--save 路径.json`。
 
-```text
-.saves/current.json
-```
-
-也可以直接使用单步命令：
+### 人类单步命令
 
 ```bash
 python game.py status
@@ -227,40 +47,20 @@ python game.py remove 7
 python game.py use large_material_pack
 ```
 
-如需使用其他存档，在命令末尾添加：
-
-```text
---save 路径.json
-```
-
-同一 seed、相同指令序列会产生相同的盘面、候选与随机触发结果。随机数状态会完整保存在 JSON 存档中，因此游戏可以稳定复现。
-
-## 核心循环
-
-1. 从成分池中无放回抽取最多 20 个成分，随机铺入 4×5 实验台。
-2. 根据九宫格邻接关系结算基础价值、加值、乘算、生成、变化、移除与其他效果。
-3. 从回合结束后的成分候选中选择一个加入实验池，也可以跳过，或消耗 Roll Token 重调候选。
-4. 在订单期限内获得足够金币。完成订单后支付目标金额，并获得保底成分、道具以及可能出现的精粹奖励。
-5. 使用删除 Token 精简实验池；使用精粹 Token，在完成订单时获得独立的一次性条件被动。
-6. 完成第 12 份订单即获得胜利。
-
-特殊成分「工程图纸」会永久扩建实验台：在第 3 列第 1 行正上方增加一个额外格，使实验台容量从 20 提升至 21。新增格与第一行第 2、3、4 列相邻。
+相同 seed 加相同操作序列会产生相同的盘面、候选和随机触发结果。
 
 ## AI Agent 接口
 
-Crucible Echoes 提供专门面向 LLM 与自动化程序的 `agent` 接口。
+`agent` 接口面向 LLM 和自动化程序。它与人类使用的 `start` 模式不同，遵循两个约定：
 
-与人类使用的 `start` 交互模式不同，`agent` 接口遵循：
-
-**一次进程调用只执行一个动作。**
-
-每次调用都只输出一行机器可读状态：
+1. 每次进程调用只执行一个动作。
+2. 每次调用后输出一行机器可读状态：
 
 ```text
 [STATE] {"protocol":"crucible-echoes-agent/v1", ...}
 ```
 
-建议 AI Agent 始终使用同一个存档路径完成整局游戏：
+建议整局始终使用同一个存档路径：
 
 ```bash
 python game.py agent new --seed 42 --difficulty 1 --save .saves/agent.json
@@ -269,7 +69,7 @@ python game.py agent choose 2 --save .saves/agent.json
 python game.py agent status --save .saves/agent.json
 ```
 
-支持的 Agent 动作为：
+支持的 Agent 动作：
 
 ```text
 new
@@ -284,94 +84,72 @@ use ITEM_ID
 help
 ```
 
-状态 JSON 中包含：
+状态 JSON 包含完整可观察状态以及：
 
-* 完整持久化 `GameState`
-* RNG 状态
-* 成分、道具与精粹定义
-* 当前待选奖励
-* 最近盘面与日志
-* `available_actions`
-* `available_action_specs`
-* 当前操作结果 `ok`
-* 当前操作 `action`
-* 错误信息 `error`
+- `available_actions` 和 `available_action_specs`
+- 当前动作、`ok` 结果和错误信息
+- 当前候选、最近盘面、日志、库存和全部定义
+- 可复现 RNG 状态
+- 召唤魔法等机制使用的 `spawn_counters`
 
-AI 玩家无需从终端排版中猜测游戏状态，只需要读取 `[STATE]` JSON，并从 `available_actions` 中选择下一步操作。
+Agent 应在每次操作后重新读取 `[STATE]`，只从 `available_actions` 中选择下一步，不要直接编辑存档。非法操作会返回退出码 `2`，但仍输出合法状态，并保持原存档不变。
 
-如果操作非法，程序会返回退出码 `2`，但仍然输出合法的 `[STATE]` JSON，并保持原存档状态不变。
+完整协议说明见 [`docs/AGENT_INTERFACE.md`](docs/AGENT_INTERFACE.md)。
 
-### 给 AI 玩家的建议
+### 给 AI Agent 的提示词
 
-如果你是一个能够执行终端命令的 AI Agent：
+> 请独立游玩《坩埚余响》。只使用 `python game.py agent ...` 接口，创建游戏后始终使用同一个 save 文件。每次命令执行后读取 `[STATE]` JSON，根据订单、金币、实验池、候选、道具、精粹、最近盘面和 `available_actions` 选择下一步。一次只执行一个动作，不要直接编辑存档，持续游玩直到胜利或失败。
 
-1. 使用 `agent` 接口，而不是 `start`。
-2. 首先运行 `agent new` 创建存档。
-3. 每次操作后重新读取 `[STATE]`。
-4. 只执行 `available_actions` 中允许的操作。
-5. 不要直接修改存档 JSON。
-6. 重复执行单步动作，直到游戏进入胜利或失败状态。
+## 核心循环
 
-换句话说，人类负责炼金也行，AI 自己把实验室炸掉也行。项目对两种智慧形式一视同仁。
+1. 从成分池中无放回抽取最多 20 个成分，随机铺入实验台。
+2. 按九宫格邻接关系结算基础价值、加值、乘算、生成、变化、移除和其他效果。
+3. 在回合结束后的候选中选择一个成分加入实验池，也可以跳过，或消耗 Roll Token 重调候选。
+4. 在订单期限内获得足够金币，完成订单后支付目标金额并领取保底奖励。
+5. 使用 Delete Token 精简实验池，使用 Essence Token 激活精粹的独立一次性条件效果。
+6. 完成第 12 份订单即获得胜利。
+
+特殊成分「工程图纸」会永久扩建实验台：在第 3 列第 1 行正上方增加一个额外格，使容量从 20 提升至 21。新增格与第一行第 2、3、4 列相邻。
 
 ## 内容与数据
 
 当前内容规模：
 
-* 成分：45 个 1 级、55 个 2 级、34 个 3 级、10 个 4 级，以及特殊成分「废渣」
-* 道具：36 个 1 级、31 个 2 级、20 个 3 级、10 个 4 级
-* 精粹：96 个独立条件效果
-* 难度：10 级累计规则
+- 成分：144 个有稀有度的成分（1 级 45 个、2 级 55 个、3 级 34 个、4 级 10 个），另有特殊成分「废渣」1 个，合计 145 个
+- 道具：100 个（1 级 36 个、2 级 33 个、3 级 21 个、4 级 10 个）
+- 精粹：97 个独立条件效果
+- 难度：10 级累计规则
 
-所有可扩充内容均位于：
+数据文件位于 `src/crucible_echoes/data/`：
 
-```text
-src/crucible_echoes/data/
-```
+- `ingredients.json`：稀有度、基础价值、标签、权重和成分效果
+- `items.json`：常驻、周期、事件和主动道具
+- `essences.json`：独立触发条件和一次性效果
+- `progression.json`：概率表、订单曲线、初始池和难度参数
 
-其中：
+最近的平衡扩展包括选矿台、拥挤实验室、怪物指南及其精粹；矿脉和召唤魔法加入了生成保底规则；不可能容器精粹的奖励调整为 75g。新增状态字段会在加载旧存档时使用安全默认值。
 
-* `ingredients.json`：稀有度、基础价值、标签、权重与成分效果
-* `items.json`：常驻、周期、事件与主动道具
-* `essences.json`：独立触发条件与一次性效果
-* `progression.json`：概率表、订单曲线、初始池与难度参数
-
-完整冻结规格见：
-
-[docs/SPEC.md](https://github.com/2424066340-sys/crucible-echoes/blob/main/docs/SPEC.md)
+完整冻结规则见 [`docs/SPEC.md`](docs/SPEC.md)。
 
 ## 机器可读输出
 
-普通命令的状态输出末尾也会附带：
+普通命令的输出末尾也会附带：
 
 ```text
 [STATE] { ...JSON... }
 ```
 
-因此脚本或 AI 玩家无需从人类可读文本中解析金币、订单、候选和最近盘面。
-
-需要严格的一次一动作机器接口时，请使用 `agent` 命令。
+需要严格的一次一动作接口时，请使用 `agent` 命令；脚本不需要解析人类可读文本。
 
 ## 测试
 
-运行：
+运行完整测试套件：
 
 ```bash
 python run_tests.py
 ```
 
-测试覆盖：
-
-* 概率表与高阶稀有度挤压
-* seed 与 RNG 状态复现
-* 九宫格与扩建格邻接
-* 永久加值
-* 变化、移除与生成
-* 订单系统
-* Token
-* 精粹
-* 累计难度规则
-* 长局状态稳定性
+测试覆盖概率与稀有度、seed/RNG 复现、邻接与扩建、永久加值、变化/移除/生成、订单、Token、精粹、累计难度、长局稳定性，以及最近新增的生成保底、池大小条件和怪物移除机制。
 
 ## 项目结构
 
@@ -384,24 +162,16 @@ src/crucible_echoes/rng.py      可保存的确定性随机流
 src/crucible_echoes/data/       数据定义
 tests/                          自动测试
 docs/SPEC.md                    冻结规则规格
+docs/AGENT_INTERFACE.md         Agent 协议说明
+LICENSE                         MIT 许可证
 ```
 
 ## 贡献
 
-欢迎新增：
-
-* 成分
-* 道具
-* 精粹
-* 测试
-* 数值平衡修订
-* AI Agent / MCP 等自动化接口
-
-提交内容请尽量保持数据驱动、可复现，并为新增机制补充对应测试。
+欢迎新增成分、道具、精粹、测试、数值平衡和自动化接口。新增机制请尽量保持数据驱动、可复现，并补充对应测试。
 
 ## Credits
 
 Developed with assistance from **ChatGPT by OpenAI**.
 
 Additional development and code assistance provided through **OpenAI Codex**.
-

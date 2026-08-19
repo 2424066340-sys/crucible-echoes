@@ -17,6 +17,8 @@ The JSON envelope contains:
   instance metadata;
 - `pending_choices`: the complete reward queue, including offer definitions;
 - `last_board` and `last_log`: the most recent observable result;
+- `stats.spawn_counters`: persisted success counters such as the summon-magic
+  guarantee counter (old saves receive an empty object automatically);
 - `available_actions`: executable command strings for the next step;
 - `available_action_specs`: the same actions in structured form;
 - `ok`, `action`, and `error`: the result of the just-completed operation.
