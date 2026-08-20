@@ -34,6 +34,7 @@ class NewItemTests(unittest.TestCase):
         new_rarities = {
             "spare_beaker": 1,
             "old_ledger": 1,
+            "order_appendix": 1,
             "wastepaper_box": 1,
             "piggy_bank": 1,
             "animal_roster": 1,

@@ -48,6 +48,59 @@ class OrdersTokensEssencesTests(unittest.TestCase):
         self.assertIn("完成第4份订单，支付150g。", engine.s.last_log)
         self.assertNotIn("完成第4份订单，支付2g。", engine.s.last_log)
 
+    def test_order_completion_only_has_guaranteed_ingredient_reward_by_default(self) -> None:
+        engine = GameEngine(); engine.new_game(1)
+        amount, _ = engine.current_order()
+        engine.s.spins_left = 1
+        engine.s.gold = amount
+
+        engine.spin()
+
+        ingredient_choices = [choice for choice in engine.s.pending if choice.kind == "ingredient"]
+        self.assertEqual(["order_guarantee"], [choice.source for choice in ingredient_choices])
+
+    def test_order_appendix_adds_one_normal_ingredient_reward(self) -> None:
+        engine = GameEngine(); engine.new_game(1)
+        engine.add_item("order_appendix")
+        amount, _ = engine.current_order()
+        engine.s.spins_left = 1
+        engine.s.gold = amount
+
+        engine.spin()
+
+        ingredient_choices = [choice for choice in engine.s.pending if choice.kind == "ingredient"]
+        self.assertEqual(["order_guarantee", "order_appendix"], [choice.source for choice in ingredient_choices])
+
+    def test_normal_spin_ingredient_reward_is_unchanged(self) -> None:
+        engine = GameEngine(); engine.new_game(1)
+        engine.s.spins_left = 2
+
+        engine.spin()
+
+        ingredient_choices = [choice for choice in engine.s.pending if choice.kind == "ingredient"]
+        self.assertEqual(["spin"], [choice.source for choice in ingredient_choices])
+
+    def test_duplicate_order_appendices_do_not_stack(self) -> None:
+        engine = GameEngine(); engine.new_game(1)
+        engine.s.items.extend(["order_appendix", "order_appendix"])
+        amount, _ = engine.current_order()
+        engine.s.spins_left = 1
+        engine.s.gold = amount
+
+        engine.spin()
+
+        appendix_choices = [choice for choice in engine.s.pending if choice.source == "order_appendix"]
+        self.assertEqual(1, len(appendix_choices))
+
+    def test_order_appendix_does_not_trigger_on_failed_order(self) -> None:
+        engine = GameEngine(); engine.new_game(1)
+        engine.add_item("order_appendix")
+
+        engine._settle_order()
+
+        self.assertEqual("lost", engine.s.status)
+        self.assertFalse(any(choice.source == "order_appendix" for choice in engine.s.pending))
+
     def test_d10_final_order_requires_extra_thirteen_order(self) -> None:
         engine = GameEngine(); engine.new_game(1, difficulty=10)
         engine.s.order_index = 11

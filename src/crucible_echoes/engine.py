@@ -484,6 +484,31 @@ class GameEngine:
                 self._round_events[round_key] = 1
                 self._gain_gold(4, item["name"])
 
+    def _item_choice_rewards_for_event(self, event: str) -> list[PendingChoice]:
+        """Build data-driven choice rewards for an event, without stacking duplicates."""
+        rewards: list[PendingChoice] = []
+        seen_items: set[str] = set()
+        for item_id in list(self.s.items):
+            if item_id in seen_items:
+                continue
+            seen_items.add(item_id)
+            item = self.catalog.items.get(item_id, {})
+            spec = item.get("event_choice_reward", {}).get(event)
+            if not spec:
+                continue
+            choices = max(0, int(spec.get("choices", 1)))
+            for _ in range(choices):
+                rewards.append(
+                    self.make_choice(
+                        str(spec.get("kind", "ingredient")),
+                        source=str(spec.get("source", item_id)),
+                        can_skip=bool(spec.get("can_skip", True)),
+                    )
+                )
+            if choices:
+                self._record_item_trigger(item_id, choices)
+        return rewards
+
     def _gain_gold(self, amount: int, source: str) -> None:
         if amount == 0:
             return
@@ -775,7 +800,9 @@ class GameEngine:
             self.add_ingredient("slag")
             self.s.last_log.append("难度规则向成分池加入1个废渣。")
         if self.s.status == "playing":
-            self.s.pending.insert(0, self.make_choice("ingredient", source="spin", can_skip=not self.s.flags.pop("force_choose", False)))
+            force_choose = bool(self.s.flags.pop("force_choose", False))
+            if self.s.spins_left > 0:
+                self.s.pending.insert(0, self.make_choice("ingredient", source="spin", can_skip=not force_choose))
             if self.s.flags.get("extra_choice_spins", 0):
                 self.s.pending.append(self.make_choice("ingredient", source="essence"))
             if self.s.spins_left <= 0:
@@ -1448,6 +1475,7 @@ class GameEngine:
         elif completed == 9: minimums = [3,3]
         else: minimums = [3,3,3]
         rewards.append(self.make_choice("ingredient", minimums=minimums, source="order_guarantee"))
+        rewards.extend(self._item_choice_rewards_for_event("order_completed"))
         item_minimums = [3] if self.s.flags.pop("order_book_reward", False) else None
         rewards.append(self.make_choice("item", minimums=item_minimums, source="order"))
         return rewards

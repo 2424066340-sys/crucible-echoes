@@ -37,6 +37,7 @@
   {"id":"basic_miner_lamp","name":"矿工灯","rarity":1,"description":"1级石头、矿和金属+1g。","bonuses":[{"tags":["stone","ore","metal"],"rarity":1,"amount":1}]},
   {"id":"spare_beaker","name":"备用烧杯","rarity":1,"description":"每4回合额外获得1组成分选择。","periodic_choice":{"every":4,"kind":"ingredient","amount":1}},
   {"id":"old_ledger","name":"旧账本","rarity":1,"description":"完成订单时获得5g。","event_bonus":{"order_completed":5}},
+  {"id":"order_appendix","name":"订单附页","rarity":1,"description":"每次完成并支付订单时，额外获得一次普通成分奖励。","event_choice_reward":{"order_completed":{"kind":"ingredient","choices":1,"source":"order_appendix"}}},
   {"id":"wastepaper_box","name":"废纸箱","rarity":1,"description":"每完成3份订单，获得1个删除Token。","event_bonus_every":{"order_completed":{"every":3,"tokens":{"remove":1}}}},
   {"id":"piggy_bank","name":"储蓄罐","rarity":1,"description":"每完成一份订单储存5g；订单失败前自动取出全部储蓄。","order_savings":{"deposit_on_complete":5,"withdraw_before_failure":true}},
   {"id":"animal_roster","name":"动物名册","rarity":1,"description":"获得后立刻获得3组成分选择，只会出现动物。","on_acquire":{"tagged_ingredient_choices":{"tag":"animal","count":3}}},

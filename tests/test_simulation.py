@@ -94,7 +94,13 @@ class SimulationTests(unittest.TestCase):
         state = policy.build_state(engine)
         self.assertIn("ore", state["tag_counts"])
         self.assertIn("ore", state["generator_tags"])
-        record = simulate_game(12, difficulty=1, max_actions=1000)
+
+        def start_with_generator(game: GameEngine) -> None:
+            game.s.ingredients.clear()
+            game.add_ingredient("vein", emit=False)
+            game.s.gold = 25
+
+        record = simulate_game(12, difficulty=1, max_actions=1000, on_start=start_with_generator)
         events = record.strategy_events["pool_events"]
         self.assertTrue(any(event["source"] == "active_choice" for event in events))
         self.assertTrue(any(source in {"automatic_generation", "summon_or_periodic"} for source in record.strategy_events["pool_origin_counts"]))
