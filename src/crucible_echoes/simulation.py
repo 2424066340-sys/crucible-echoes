@@ -52,6 +52,10 @@ class HeuristicStrategy(SimulationStrategy):
         "id", "name", "rarity", "base", "tags", "description", "offerable", "removable",
     }
 
+    def __init__(self) -> None:
+        self._build_state_cache_key: tuple[tuple[str, str], ...] | None = None
+        self._build_state_cache: dict[str, Any] | None = None
+
     def _tags_for(self, engine: GameEngine, def_id: str) -> set[str]:
         return set(engine.catalog.ingredients.get(def_id, {}).get("tags", []))
 
@@ -68,6 +72,12 @@ class HeuristicStrategy(SimulationStrategy):
         signatures rather than a fixed list of named decks.  This makes the
         same logic work for newly added content without hidden ID bonuses.
         """
+        cache_key = tuple(
+            (instance.def_id, str(instance.flags.get("_sim_origin", "unknown")))
+            for instance in engine.s.ingredients
+        )
+        if cache_key == self._build_state_cache_key and self._build_state_cache is not None:
+            return self._build_state_cache
         tag_counts: Counter[str] = Counter()
         origins: Counter[str] = Counter()
         generator_tags: Counter[str] = Counter()
@@ -90,7 +100,7 @@ class HeuristicStrategy(SimulationStrategy):
         primary = [tag for tag, _ in tag_counts.most_common(3)]
         core = [tag for tag, count in tag_counts.items() if count >= 2]
         mechanism = sorted(set(generator_tags) | set(mechanism_tags))
-        return {
+        state = {
             "pool_size": len(engine.s.ingredients),
             "tag_counts": dict(tag_counts),
             "primary_tags": primary,
@@ -100,6 +110,9 @@ class HeuristicStrategy(SimulationStrategy):
             "origin_counts": dict(origins),
             "generator_count": sum(generator_tags.values()),
         }
+        self._build_state_cache_key = cache_key
+        self._build_state_cache = state
+        return state
 
     def _pool_pressure(self, pool_size: int) -> float:
         # Pressure rises gradually and is not a hard cap.  The provenance
@@ -442,6 +455,106 @@ class HeuristicStrategy(SimulationStrategy):
 
     def score(self, engine: GameEngine, kind: str, def_id: str) -> float:
         return sum(self.score_components(engine, kind, def_id).values())
+
+
+class HeuristicV2Strategy(HeuristicStrategy):
+    """A more conservative player model that skips cards and controls the pool.
+
+    v2 deliberately reuses v1's data-derived scoring and archetype detection.
+    Its only policy change is willingness to accept ingredient choices: once
+    the pool is above 20, ordinary low-confidence choices are skipped; above
+    26, deletion is preferred before the next spin whenever a generic
+    low-retention entry can be released. No definition IDs are special-cased
+    and the strategy never consumes RNG of its own.
+    """
+
+    name = "heuristic-v2"
+
+    def _acceptance_threshold(self, engine: GameEngine, def_id: str) -> float:
+        pool_size = len(engine.s.ingredients)
+        if pool_size <= 20:
+            return float("-inf")
+        if pool_size <= 26:
+            threshold = 6.5 + (pool_size - 20) * 0.35
+        else:
+            threshold = 9.0 + min(4.0, (pool_size - 26) * 0.6)
+        fit = self._archetype_fit(engine, engine.catalog.ingredients[def_id])
+        return threshold - min(2.5, fit * 0.55)
+
+    def choose(self, engine: GameEngine, choice: PendingChoice) -> int | None:
+        if not choice.offers:
+            return None
+        selected = super().choose(engine, choice)
+        if selected is None or choice.kind != "ingredient" or not choice.can_skip:
+            return selected
+        selected_id = choice.offers[selected - 1]
+        score = self.score(engine, "ingredient", selected_id)
+        future = self._long_term_ingredient_value(
+            engine, engine.catalog.ingredients[selected_id]
+        )
+        fit = self._archetype_fit(engine, engine.catalog.ingredients[selected_id])
+        if len(engine.s.ingredients) > 20 and score < self._acceptance_threshold(engine, selected_id):
+            return None
+        if len(engine.s.ingredients) > 26 and future < 4.0 and fit < 3.0:
+            return None
+        return selected
+
+    def should_reroll(self, engine: GameEngine, choice: PendingChoice) -> bool:
+        if choice.kind != "ingredient" or not choice.offers:
+            return super().should_reroll(engine, choice)
+        if engine.s.tokens.get("roll", 0) <= 0:
+            return False
+        scored = [
+            (self.score(engine, "ingredient", def_id), def_id)
+            for def_id in choice.offers
+        ]
+        best, best_id = max(scored, key=lambda row: (row[0], row[1]))
+        if len(engine.s.ingredients) <= 20:
+            return super().should_reroll(engine, choice)
+        fit = self._archetype_fit(engine, engine.catalog.ingredients[best_id])
+        threshold = self._acceptance_threshold(engine, best_id)
+        return best < threshold and fit < 3.5
+
+    def removal_index(self, engine: GameEngine) -> int | None:
+        pool_size = len(engine.s.ingredients)
+        if engine.s.tokens.get("remove", 0) <= 0 or pool_size <= 26:
+            return None
+        candidates = []
+        for index, instance in enumerate(engine.s.ingredients, 1):
+            row = engine.catalog.ingredients[instance.def_id]
+            if not row.get("removable", True):
+                continue
+            components = self.score_components(engine, "ingredient", instance.def_id)
+            origin = str(instance.flags.get("_sim_origin", "unknown"))
+            cost = self._candidate_pool_cost(engine, instance.def_id, origin)
+            fit = self._archetype_fit(engine, row)
+            retention = sum(components.values()) + fit
+            deletion_score = retention - cost * 2.5
+            if fit >= 2.0 and self._long_term_ingredient_value(engine, row) >= 4.0:
+                deletion_score += 4.0
+            candidates.append((deletion_score, cost, fit, index))
+        if not candidates:
+            return None
+        weakest_score, weakest_cost, weakest_fit, weakest_index = min(
+            candidates, key=lambda row: (row[0], row[1], row[3])
+        )
+        if weakest_fit >= 3.0 and weakest_score >= 5.0:
+            return None
+        if weakest_cost >= 0.65 or weakest_score < 8.5:
+            return weakest_index
+        return None
+
+
+def strategy_from_name(name: str) -> SimulationStrategy:
+    """Construct one of the built-in deterministic simulation strategies."""
+    strategies = {
+        "heuristic-v1": HeuristicStrategy,
+        "heuristic-v2": HeuristicV2Strategy,
+    }
+    try:
+        return strategies[name]()
+    except KeyError as exc:
+        raise ValueError(f"未知模拟策略：{name}") from exc
 
 
 @dataclass
@@ -996,9 +1109,10 @@ def _content_row(definition: dict[str, Any], kind: str) -> dict[str, Any]:
 
 
 class BatchAccumulator:
-    def __init__(self, catalog: Catalog, games: int) -> None:
+    def __init__(self, catalog: Catalog, games: int, *, retain_details: bool = True) -> None:
         self.catalog = catalog
         self.games = games
+        self.retain_details = retain_details
         self.content: dict[str, dict[str, dict[str, Any]]] = {
             "items": {
                 row["id"]: _content_row(row, "item") for row in catalog.items.values()
@@ -1025,6 +1139,8 @@ class BatchAccumulator:
         self.pool_event_counts: Counter[str] = Counter()
         self.pool_event_sizes: list[float] = []
         self.growth: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        self.total_rolls = 0
+        self.total_deletes = 0
 
     def _category(self, kind: str, def_id: str) -> str | None:
         return _content_category(self.catalog, kind, def_id)
@@ -1059,7 +1175,34 @@ class BatchAccumulator:
         point["essence_tokens_sum"] += int(state.tokens.get("essence", 0))
 
     def observe_record(self, record: GameRecord) -> None:
-        self.records.append(record)
+        self.total_rolls += len(record.strategy_events.get("rolls", []))
+        self.total_deletes += len(record.strategy_events.get("deletes", []))
+        if self.retain_details:
+            self.records.append(record)
+        else:
+            # Keep only fields needed for aggregate rates and curves. Full
+            # per-action telemetry is intentionally optional for large scans.
+            self.records.append(GameRecord(
+                index=record.index,
+                seed=record.seed,
+                status=record.status,
+                won=record.won,
+                end_layer=record.end_layer,
+                orders_completed=record.orders_completed,
+                spins=record.spins,
+                action_count=record.action_count,
+                gold=record.gold,
+                final_attributes=record.final_attributes,
+                held_items=[],
+                held_ingredients=[],
+                held_equipment=[],
+                held_essences=[],
+                content_stats={},
+                selected_content={},
+                strategy_events={},
+                death_reason=record.death_reason,
+                error=record.error,
+            ))
         self.max_pool_sizes.append(int(record.final_attributes.get("max_pool_size", len(record.held_ingredients) + len(record.held_equipment))))
         self.roll_events.extend(record.strategy_events.get("rolls", []))
         self.delete_events.extend(record.strategy_events.get("deletes", []))
@@ -1245,8 +1388,8 @@ class BatchAccumulator:
                 "26-30": sum(26 <= size <= 30 for size in self.max_pool_sizes),
                 ">30": sum(size > 30 for size in self.max_pool_sizes),
             },
-            "average_rolls": sum(len(record.strategy_events.get("rolls", [])) for record in self.records) / self.games if self.games else 0.0,
-            "average_deletes": sum(len(record.strategy_events.get("deletes", [])) for record in self.records) / self.games if self.games else 0.0,
+            "average_rolls": self.total_rolls / self.games if self.games else 0.0,
+            "average_deletes": self.total_deletes / self.games if self.games else 0.0,
             "pool_origin_counts": dict(self.pool_origin_counts),
             "pool_event_counts": dict(self.pool_event_counts),
             "average_pool_event_size": sum(self.pool_event_sizes) / len(self.pool_event_sizes) if self.pool_event_sizes else 0.0,
@@ -1266,7 +1409,7 @@ class BatchAccumulator:
             content={category: list(rows.values()) for category, rows in self.content.items()},
             growth_curve=growth_curve,
             anomalies=anomalies,
-            games_detail=[record.to_dict() for record in self.records],
+            games_detail=[record.to_dict() for record in self.records] if self.retain_details else [],
             notes=[
                 "相关性指标不是因果证明；选择策略会影响选择率和持有时通关率。",
                 f"疑似强弱标记要求至少观察到 {max(10, self.games // 50)} 次候选出现。",
@@ -1520,6 +1663,7 @@ def run_batch(
     strategy: SimulationStrategy | None = None,
     max_actions: int = 5000,
     catalog: Catalog | None = None,
+    retain_details: bool = True,
 ) -> SimulationReport:
     if games < 1:
         raise ValueError("模拟局数必须至少为1")
@@ -1527,7 +1671,7 @@ def run_batch(
         raise ValueError("max_actions必须至少为1")
     policy = strategy or HeuristicStrategy()
     active_catalog = catalog or Catalog.load()
-    accumulator = BatchAccumulator(active_catalog, games)
+    accumulator = BatchAccumulator(active_catalog, games, retain_details=retain_details)
     for index in range(games):
         game_seed = derive_seed(seed, index)
         record = simulate_game(
@@ -1551,6 +1695,7 @@ def run_difficulty_sweep(
     strategy: SimulationStrategy | None = None,
     max_actions: int = 5000,
     catalog: Catalog | None = None,
+    retain_details: bool = True,
 ) -> DifficultySweepReport:
     if not games_by_difficulty:
         raise ValueError("至少需要一个难度")
@@ -1567,6 +1712,7 @@ def run_difficulty_sweep(
             difficulty=difficulty,
             strategy=policy,
             max_actions=max_actions,
+            retain_details=retain_details,
             catalog=catalog,
         )
     adjacent_jumps: list[dict[str, Any]] = []

@@ -140,6 +140,9 @@ class BalanceExtensionTests(unittest.TestCase):
         self.assertEqual(4, catalog.items["blue_reagent"]["round_condition"]["gold"])
         self.assertEqual(8, catalog.items["sorting_bin"]["event_bonus"]["removed_ids:ash,rust,alchemy_scrap"])
         self.assertEqual(1.0, catalog.items["magic_filter"]["negative_cancel_chance"])
+        self.assertEqual(3, catalog.items["anomaly_recorder"]["rarity"])
+        self.assertEqual(3, catalog.items["reaction_echo"]["rarity"])
+        self.assertIn("正的永久加值", catalog.items["reaction_echo"]["description"])
         self.assertEqual(4, catalog.items["spare_key"]["event_bonus"]["opened"])
         self.assertIn("4g", catalog.items["spare_key"]["description"])
         self.assertEqual(4, catalog.items["small_safe"]["event_bonus"]["token"])
@@ -150,6 +153,37 @@ class BalanceExtensionTests(unittest.TestCase):
         self.assertEqual([1, 1, 2, 2], catalog.items["large_reactor"]["on_acquire"]["fixed_ingredient_choices"])
         self.assertEqual(0.30, 0.30 if "30%" in catalog.ingredients["paper"]["description"] else 0.0)
         self.assertEqual({"minimum": 3, "count": 2}, catalog.ingredients["lucky_potion"]["potion"]["choice_minimum"])
+
+    def test_reaction_echo_pays_once_for_positive_permanent_bonus(self) -> None:
+        engine = self.fresh()
+        source = engine.add_ingredient("water", emit=False)
+        engine.s.items.append("reaction_echo")
+        self.assertIsNotNone(source)
+        engine._permanent_bonus(source, 3)
+        self.assertEqual(3, engine.s.gold)
+        engine._permanent_bonus(source, 2)
+        self.assertEqual(3, engine.s.gold)
+        self.assertEqual(5, source.permanent_bonus)
+
+    def test_reaction_echo_ignores_negative_bonus_without_losing_gold(self) -> None:
+        engine = self.fresh()
+        source = engine.add_ingredient("water", emit=False)
+        engine.s.items.append("reaction_echo")
+        self.assertIsNotNone(source)
+        engine._permanent_bonus(source, -1)
+        self.assertEqual(0, engine.s.gold)
+        self.assertNotIn("reaction_echo", engine._round_events)
+
+    def test_reaction_echo_resets_on_new_round(self) -> None:
+        engine = self.fresh()
+        source = engine.add_ingredient("water", emit=False)
+        engine.s.items.append("reaction_echo")
+        self.assertIsNotNone(source)
+        engine._permanent_bonus(source, 1)
+        self.assertEqual(1, engine.s.gold)
+        engine._round_events = defaultdict(int)
+        engine._permanent_bonus(source, 2)
+        self.assertEqual(3, engine.s.gold)
 
     def test_brown_reagent_pays_three_for_each_pair_of_new_ingredients(self) -> None:
         engine = self.fresh()

@@ -10,7 +10,14 @@ from pathlib import Path
 from crucible_echoes.cli import main
 from crucible_echoes.engine import GameEngine
 from crucible_echoes.model import PendingChoice
-from crucible_echoes.simulation import HeuristicStrategy, run_batch, run_difficulty_sweep, simulate_game
+from crucible_echoes.simulation import (
+    HeuristicStrategy,
+    HeuristicV2Strategy,
+    run_batch,
+    run_difficulty_sweep,
+    simulate_game,
+    strategy_from_name,
+)
 
 
 class SimulationTests(unittest.TestCase):
@@ -41,6 +48,27 @@ class SimulationTests(unittest.TestCase):
         self.assertIsNotNone(policy.removal_index(engine))
         engine.s.ingredients = engine.s.ingredients[:25]
         self.assertIsNone(policy.choose(engine, PendingChoice(kind="ingredient", offers=["oil", "oil", "oil"])))
+
+    def test_heuristic_v2_skips_after_twenty_and_deletes_after_twenty_six(self) -> None:
+        engine = GameEngine()
+        engine.new_game(7, difficulty=1)
+        engine.s.ingredients.clear()
+        for _ in range(21):
+            engine.add_ingredient("water", emit=False)
+        policy = HeuristicV2Strategy()
+        self.assertIsNone(policy.choose(engine, PendingChoice(kind="ingredient", offers=["oil"])))
+
+        for _ in range(6):
+            engine.add_ingredient("water", emit=False)
+        engine.s.tokens["remove"] = 1
+        self.assertEqual(1, policy.removal_index(engine))
+        self.assertEqual("heuristic-v2", strategy_from_name("heuristic-v2").name)
+
+    def test_heuristic_v2_batch_is_seed_reproducible(self) -> None:
+        first = run_batch(games=6, seed=2468, difficulty=1, strategy=HeuristicV2Strategy())
+        second = run_batch(games=6, seed=2468, difficulty=1, strategy=HeuristicV2Strategy())
+        self.assertEqual(first.to_dict(), second.to_dict())
+        self.assertEqual("heuristic-v2", first.strategy)
 
     def test_pool_cost_uses_provenance_and_releases(self) -> None:
         engine = GameEngine()
@@ -122,6 +150,13 @@ class SimulationTests(unittest.TestCase):
         self.assertIn("ingredients", report.content)
         self.assertTrue(any(row["id"] == "water" for row in report.content["ingredients"]))
 
+    def test_large_scan_can_drop_per_game_details_but_keep_summary(self) -> None:
+        report = run_batch(games=4, seed=101, difficulty=1, retain_details=False)
+        self.assertEqual(4, report.summary["games_recorded"])
+        self.assertEqual([], report.games_detail)
+        self.assertGreaterEqual(report.summary["average_rolls"], 0.0)
+        self.assertGreaterEqual(report.summary["average_deletes"], 0.0)
+
     def test_simulate_cli_writes_human_and_json_reports(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             markdown = Path(directory) / "balance.md"
@@ -148,6 +183,24 @@ class SimulationTests(unittest.TestCase):
             self.assertIn("ingredients", data["content"])
             self.assertIn("### 成分", markdown.read_text(encoding="utf-8"))
             self.assertIn("自动标记的疑似平衡异常", markdown.read_text(encoding="utf-8"))
+
+    def test_simulate_cli_accepts_heuristic_v2(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = main([
+                    "simulate",
+                    "--games", "1",
+                    "--seed", "7",
+                    "--strategy", "heuristic-v2",
+                    "--summary-only",
+                    "--report", str(root / "v2.md"),
+                    "--json-report", str(root / "v2.json"),
+                ])
+            self.assertEqual(0, code)
+            data = json.loads((root / "v2.json").read_text(encoding="utf-8"))
+            self.assertEqual("heuristic-v2", data["config"]["strategy"])
+            self.assertEqual([], data["games"])
 
     def test_single_game_can_use_replacement_strategy(self) -> None:
         class FirstOfferStrategy(HeuristicStrategy):

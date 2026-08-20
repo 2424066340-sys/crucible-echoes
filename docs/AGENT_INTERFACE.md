@@ -16,9 +16,13 @@ The JSON envelope contains:
 - `ingredients`, `items_detail`, `essences_detail`: owned definitions and
   instance metadata;
 - `pending_choices`: the complete reward queue, including offer definitions;
+- tagged reward queues expose `tag_filter`, so an agent can see that roster
+  choices are restricted before selecting or rerolling;
 - `last_board` and `last_log`: the most recent observable result;
 - `stats.spawn_counters`: persisted success counters such as the summon-magic
   guarantee counter (old saves receive an empty object automatically);
+- `state.stats.item_storage`: persisted balances such as the piggy-bank reserve
+  (old saves receive an empty object automatically);
 - `available_actions`: executable command strings for the next step;
 - `available_action_specs`: the same actions in structured form;
 - `ok`, `action`, and `error`: the result of the just-completed operation.
@@ -38,6 +42,10 @@ Supported agent actions are `new`, `status`, `spin`, `choose N`, `skip`,
 `reroll`, `remove N`, `inventory`, `use ITEM_ID`, and `help`. Mutating actions
 load the save, execute one engine action, save the resulting state, and exit.
 Read-only actions also emit the same state envelope.
+
+Active items such as the sandpaper box and easter-egg box appear as
+`use ITEM_ID` in both `available_actions` and `available_action_specs`. They are
+never exchanged automatically.
 
 When an action is invalid, the process returns exit code `2` but still emits a
 single `[STATE]` line with `ok: false`, an error object, and the unchanged

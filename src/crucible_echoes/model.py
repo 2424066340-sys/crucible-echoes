@@ -26,6 +26,7 @@ class PendingChoice:
     can_skip: bool = True
     source: str = "spin"
     minimum_rarity: int | None = None
+    tag_filter: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PendingChoice":
@@ -71,5 +72,6 @@ class GameState:
         stats.setdefault("spawn_counters", {})
         stats.setdefault("item_event_counts", {})
         stats.setdefault("item_trigger_counts", {})
+        stats.setdefault("item_storage", {})
         copied["stats"] = stats
         return cls(**copied)

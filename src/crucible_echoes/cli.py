@@ -9,7 +9,7 @@ from pathlib import Path
 from .catalog import Catalog
 from .engine import GameEngine, GameError
 from .save import load_game, save_game
-from .simulation import run_batch, run_difficulty_sweep, write_report, write_sweep_report
+from .simulation import run_batch, run_difficulty_sweep, strategy_from_name, write_report, write_sweep_report
 
 DEFAULT_SAVE = Path(".saves/current.json")
 
@@ -24,7 +24,7 @@ COMMAND_HELP = """可用命令：
   remove N                           消耗1个删除Token移除库存第N个成分
   inventory                          查看成分、道具、精粹和Token
   use ITEM_ID                        使用主动道具
-  simulate --games N                 批量模拟并生成平衡报告
+  simulate --games N                 批量模拟并生成平衡报告（可选--strategy heuristic-v1/v2）
   help                               显示本帮助
   quit                               退出交互模式
 """
@@ -61,18 +61,22 @@ def build_parser() -> argparse.ArgumentParser:
     simulate.add_argument("--games", type=int, default=1000, help="模拟局数，默认1000")
     simulate.add_argument("--seed", type=int, default=1, help="批量基础seed")
     simulate.add_argument("--difficulty", type=int, default=1)
+    simulate.add_argument("--strategy", choices=("heuristic-v1", "heuristic-v2"), default="heuristic-v1")
     simulate.add_argument("--max-actions", type=int, default=5000, help="单局动作上限")
     simulate.add_argument("--report", default="reports/balance_report.md", help="Markdown报告路径")
     simulate.add_argument("--json-report", default="reports/balance_report.json", help="JSON明细报告路径")
+    simulate.add_argument("--summary-only", action="store_true", help="只保留汇总和内容统计，适合大规模扫描")
 
     sweep = sub.add_parser("simulate-sweep", help="批量模拟难度1-10")
     sweep.add_argument("--seed", type=int, default=1, help="固定base seed")
     sweep.add_argument("--games-low", type=int, default=1000, help="难度1-5每档局数")
     sweep.add_argument("--games-high", type=int, default=500, help="难度6-10每档局数")
+    sweep.add_argument("--strategy", choices=("heuristic-v1", "heuristic-v2"), default="heuristic-v1")
     sweep.add_argument("--max-actions", type=int, default=5000, help="单局动作上限")
     sweep.add_argument("--report", default="reports/balance_sweep.md", help="汇总Markdown报告")
     sweep.add_argument("--json-report", default="reports/balance_sweep.json", help="汇总JSON报告")
     sweep.add_argument("--detail-directory", default="reports/balance_sweep", help="各难度明细目录")
+    sweep.add_argument("--summary-only", action="store_true", help="只保留汇总和内容统计，适合大规模扫描")
 
     # Keep the machine interface separate from the human-oriented commands.
     # Every ``agent`` invocation performs at most one action and emits one
@@ -255,7 +259,9 @@ def run_simulation_command(ns: argparse.Namespace) -> int:
         games=ns.games,
         seed=ns.seed,
         difficulty=ns.difficulty,
+        strategy=strategy_from_name(ns.strategy),
         max_actions=ns.max_actions,
+        retain_details=not ns.summary_only,
     )
     write_report(report, ns.report, ns.json_report)
     print(report.to_markdown(), end="")
@@ -275,7 +281,9 @@ def run_simulation_sweep_command(ns: argparse.Namespace) -> int:
     report = run_difficulty_sweep(
         games_by_difficulty=games_by_difficulty,
         seed=ns.seed,
+        strategy=strategy_from_name(ns.strategy),
         max_actions=ns.max_actions,
+        retain_details=not ns.summary_only,
     )
     write_sweep_report(report, ns.report, ns.json_report, ns.detail_directory)
     print(report.to_markdown(), end="")

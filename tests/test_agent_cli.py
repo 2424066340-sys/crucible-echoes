@@ -9,7 +9,7 @@ from pathlib import Path
 
 from crucible_echoes.cli import main
 from crucible_echoes.engine import GameEngine
-from crucible_echoes.save import load_game
+from crucible_echoes.save import load_game, save_game
 
 
 class AgentCliTests(unittest.TestCase):
@@ -78,6 +78,24 @@ class AgentCliTests(unittest.TestCase):
             self.assertEqual(resumed.last_board, direct.s.last_board)
             self.assertEqual(resumed.pending[0].offers, direct.s.pending[0].offers)
             self.assertEqual(resumed.rng_state, direct.s.rng_state)
+
+    def test_agent_can_optionally_exchange_a_consumable_box(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            save = Path(directory) / "agent.json"
+            engine = GameEngine()
+            engine.new_game(2718)
+            engine.add_item("sandpaper_box")
+            save_game(engine.s, save)
+
+            code, before = self.call_agent(save, "status")
+            self.assertEqual(0, code)
+            self.assertIn("use sandpaper_box", before["available_actions"])
+
+            code, after = self.call_agent(save, "use", "sandpaper_box")
+            self.assertEqual(0, code)
+            self.assertNotIn("sandpaper_box", after["items"])
+            self.assertEqual(2, sum(row["id"] == "sandpaper" for row in after["ingredients"]))
+            self.assertNotIn("use sandpaper_box", after["available_actions"])
 
 
 if __name__ == "__main__":
