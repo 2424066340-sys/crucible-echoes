@@ -16,10 +16,9 @@ class LongRunTests(unittest.TestCase):
             engine.spin()
             spins += 1
         self.assertEqual("won", engine.s.status)
-        self.assertEqual(12, engine.s.order_index)
+        self.assertEqual(13, engine.s.order_index)
         self.assertLess(spins, 400)
 
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -36,12 +36,12 @@
   "difficulty": {
     "2": {"order_bonus": {"7": 25}},
     "3": {"order_bonus": {"8": 25}},
-    "4": {"token_reward": 1},
+    "4": {"token_reward": {"remove": 1, "roll": 1}},
     "5": {"initial_slag": 1},
     "6": {"order_bonus": {"10": 25}, "initial_slag": 2},
     "7": {"order_bonus": {"11": 25}, "slag_interval": 25},
     "8": {"initial_slag": 3, "slag_interval": 20},
     "9": {"order_bonus": {"9": 25}, "slag_interval": 15},
-    "10": {"final_marker": true}
+    "10": {"token_reward": {"essence": 1}, "final_order": {"after_completed": 12, "amount": 1350, "spins": 15}}
   }
 }

@@ -49,6 +49,39 @@ python game.py use large_material_pack
 
 相同 seed 加相同操作序列会产生相同的盘面、候选和随机触发结果。
 
+### 批量模拟与平衡报告
+
+无需人工操作即可运行批量对局。默认运行 1000 局，并生成 Markdown 报告和包含逐局明细的 JSON 报告：
+
+```bash
+python game.py simulate --games 1000 --seed 42 --difficulty 1
+```
+
+可用参数：
+
+```bash
+python game.py simulate \
+  --games 5000 \
+  --seed 42 \
+  --difficulty 10 \
+  --report reports/difficulty10.md \
+  --json-report reports/difficulty10.json
+```
+
+按难度 1-5 每档 1000 局、难度 6-10 每档 500 局运行完整难度扫描：
+
+```bash
+python game.py simulate-sweep \
+  --seed 424242 \
+  --games-low 1000 \
+  --games-high 500 \
+  --report reports/balance_sweep.md \
+  --json-report reports/balance_sweep.json \
+  --detail-directory reports/balance_sweep
+```
+
+模拟使用可替换的 `heuristic-v1` 策略：基于稀有度、基础收益、永久成长、周期收益、标签协同和后期潜力评分，并把成分池来源区分为主动选择、自动生成、转化、召唤/周期生成、一次性临时生成等类型；成分池以25个为软上限、30个为硬上限，池过大时会跳过低价值候选并按来源感知的占池成本优先删除低价值可删除成分，必要时才消耗 Roll Token。策略不额外抽取 RNG，且不硬编码具体成分 ID。报告包含通关率、各层死亡率、金币与属性成长曲线、池来源遥测，以及普通成分、物品、装备和精粹的候选出现、选择、获取、触发/消耗和最终持有表现。疑似过强/过弱标记仅供人工复核。难度扫描还会输出 1-10 通关率曲线和相邻难度跳变。
+
 ## AI Agent 接口
 
 `agent` 接口面向 LLM 和自动化程序。它与人类使用的 `start` 模式不同，遵循两个约定：
@@ -107,7 +140,7 @@ Agent 应在每次操作后重新读取 `[STATE]`，只从 `available_actions` �
 3. 在回合结束后的候选中选择一个成分加入实验池，也可以跳过，或消耗 Roll Token 重调候选。
 4. 在订单期限内获得足够金币，完成订单后支付目标金额并领取保底奖励。
 5. 使用 Delete Token 精简实验池，使用 Essence Token 激活精粹的独立一次性条件效果。
-6. 完成第 12 份订单即获得胜利。
+6. 完成第 12 份订单即获得胜利；难度10在第12份后追加一份15回合、1350g的最终订单。
 
 特殊成分「工程图纸」会永久扩建实验台：在第 3 列第 1 行正上方增加一个额外格，使容量从 20 提升至 21。新增格与第一行第 2、3、4 列相邻。
 
@@ -127,7 +160,7 @@ Agent 应在每次操作后重新读取 `[STATE]`，只从 `available_actions` �
 - `essences.json`：独立触发条件和一次性效果
 - `progression.json`：概率表、订单曲线、初始池和难度参数
 
-最近的平衡扩展包括选矿台、拥挤实验室、怪物指南及其精粹；矿脉和召唤魔法加入了生成保底规则；不可能容器精粹的奖励调整为 75g。新增状态字段会在加载旧存档时使用安全默认值。
+最近的平衡扩展包括选矿台、拥挤实验室、怪物指南及其精粹；矿脉和召唤魔法加入了生成保底规则；不可能容器精粹的奖励调整为 75g。当前平衡值还包括：棕色试剂每累计 2 个新成分获得 3g，猫砂盆每移除一只猫获得 6g，黄金幸运核心稀有度倍率为 ×3；双倍账本、工具腰带、试剂架的卡牌稀有度分别上调一级；魔法滤网使负面魔法不再触发负面效果，分类垃圾桶的目标移除奖励为 8g，蓝色试剂的触发奖励为 4g。不可能容器在成分池超过 30 个后才开始提供收益，且每回合上限为 10g。选矿台对所有矿物生成提供至少2级保证；幸运魔药连续保障两次成分选择；纸张的永久成长概率为30%；小保险箱每次获得Token奖励4g；备用钥匙每次打开箱子额外获得4g；魔法魔法基础价值为2g。难度4只降低删除与Roll奖励，难度10的精粹奖励为1个并追加最终订单。新增状态字段会在加载旧存档时使用安全默认值。
 
 完整冻结规则见 [`docs/SPEC.md`](docs/SPEC.md)。
 
@@ -157,6 +190,7 @@ python run_tests.py
 game.py                         零安装入口
 src/crucible_echoes/cli.py      CLI、人类交互模式与 Agent 接口
 src/crucible_echoes/engine.py   状态机、结算与事件系统
+src/crucible_echoes/simulation.py 批量模拟、策略与平衡报告
 src/crucible_echoes/model.py    JSON 可序列化状态
 src/crucible_echoes/rng.py      可保存的确定性随机流
 src/crucible_echoes/data/       数据定义

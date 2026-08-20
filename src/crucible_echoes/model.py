@@ -25,6 +25,7 @@ class PendingChoice:
     offers: list[str]
     can_skip: bool = True
     source: str = "spin"
+    minimum_rarity: int | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PendingChoice":
@@ -68,5 +69,7 @@ class GameState:
         copied["pending"] = [PendingChoice.from_dict(x) for x in copied.get("pending", [])]
         stats = dict(copied.get("stats") or {})
         stats.setdefault("spawn_counters", {})
+        stats.setdefault("item_event_counts", {})
+        stats.setdefault("item_trigger_counts", {})
         copied["stats"] = stats
         return cls(**copied)
