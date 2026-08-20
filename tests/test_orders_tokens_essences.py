@@ -36,6 +36,18 @@ class OrdersTokensEssencesTests(unittest.TestCase):
             essence_choices = [x for x in engine.s.pending if x.kind == "essence"]
             self.assertEqual(expected_essence, len(essence_choices))
 
+    def test_order_log_keeps_order_amount_after_token_rewards(self) -> None:
+        engine = GameEngine(); engine.new_game(1)
+        engine.s.order_index = 3  # fourth order: 150g
+        engine.s.spins_left = 1
+        engine.s.gold = 200
+
+        engine._settle_order()
+
+        self.assertEqual(50, engine.s.gold)
+        self.assertIn("完成第4份订单，支付150g。", engine.s.last_log)
+        self.assertNotIn("完成第4份订单，支付2g。", engine.s.last_log)
+
     def test_d10_final_order_requires_extra_thirteen_order(self) -> None:
         engine = GameEngine(); engine.new_game(1, difficulty=10)
         engine.s.order_index = 11

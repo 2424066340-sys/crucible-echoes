@@ -1426,7 +1426,7 @@ class GameEngine:
         if completed >= 12 and self._final_order_for(completed, self.s.difficulty) is None: self.s.status = "won"
         token_amounts = self.token_reward_amounts(self.s.difficulty)
         if completed >= 4 and completed % 2 == 0:
-            for token, amount in token_amounts.items(): self._gain_token(token, amount, "订单周期奖励")
+            for token, token_amount in token_amounts.items(): self._gain_token(token, token_amount, "订单周期奖励")
         self.s.pending.extend(self._order_rewards(completed))
         essence_tokens = int(self.s.tokens.get("essence", 0))
         self.s.tokens["essence"] = 0
