@@ -15,6 +15,19 @@ class GameError(RuntimeError):
 
 MINERAL_TAGS = frozenset({"stone", "ore", "metal"})
 
+RUN_END_OPTIONS = {
+    "end_run": {
+        "id": "end_run",
+        "name": "结束本局",
+        "description": "按正常通关处理，结束本局。",
+    },
+    "enter_endless": {
+        "id": "enter_endless",
+        "name": "进入无限模式",
+        "description": "保留当前状态，进入10回合的无限订单1。",
+    },
+}
+
 
 class GameEngine:
     def __init__(self, catalog: Catalog | None = None):
@@ -57,7 +70,19 @@ class GameEngine:
                 "item_event_counts": {},
                 "item_trigger_counts": {},
                 "item_storage": {},
+                "endless_orders_completed": 0,
+                "highest_endless_order": 0,
+                "highest_endless_single_turn_gold": 0,
+                "highest_single_turn_gold": 0,
             },
+            flags={
+                "choice_minimum_count": 0,
+                "choice_minimum_rarity": 0,
+                "choice_minimum_reserved": 0,
+            },
+            endless_mode=False,
+            endless_order=0,
+            endless_target=0,
         )
         self.state = state
         for def_id in self.catalog.progression["initial_ingredients"]:
@@ -82,6 +107,10 @@ class GameEngine:
         self.s.stats.setdefault("item_event_counts", {})
         self.s.stats.setdefault("item_trigger_counts", {})
         self.s.stats.setdefault("item_storage", {})
+        self.s.stats.setdefault("endless_orders_completed", 0)
+        self.s.stats.setdefault("highest_endless_order", 0)
+        self.s.stats.setdefault("highest_endless_single_turn_gold", 0)
+        self.s.stats.setdefault("highest_single_turn_gold", 0)
         self.s.flags.setdefault("choice_minimum_count", 0)
         self.s.flags.setdefault("choice_minimum_rarity", 0)
         self.s.flags.setdefault("choice_minimum_reserved", 0)
@@ -115,12 +144,8 @@ class GameEngine:
 
     @staticmethod
     def slag_interval(difficulty: int) -> int | None:
-        if difficulty >= 9:
-            return 15
-        if difficulty >= 8:
-            return 20
         if difficulty >= 7:
-            return 25
+            return 15
         return None
 
     def current_order_for(self, completed: int, difficulty: int, flags: dict[str, Any]) -> tuple[int, int]:
@@ -170,7 +195,23 @@ class GameEngine:
         return amounts
 
     def current_order(self) -> tuple[int, int]:
+        if self.s.endless_mode:
+            return max(0, int(self.s.endless_target)), 10
         return self.current_order_for(self.s.order_index, self.s.difficulty, self.s.flags)
+
+    @staticmethod
+    def next_endless_target(target: int) -> int:
+        """Return ceil(target * 1.5) using integer arithmetic."""
+        if target <= 0:
+            return 1000
+        return (int(target) * 3 + 1) // 2
+
+    def _mainline_complete(self, completed: int, difficulty: int) -> bool:
+        """Whether the just-completed order is the final normal-line order."""
+        if completed < 12:
+            return False
+        # D10's declarative 1350g/15-spin order is completed at order 13.
+        return self._final_order_for(completed, difficulty) is None
 
     def rarity_table(self, kind: str) -> list[float]:
         completed = self.s.order_index
@@ -710,6 +751,8 @@ class GameEngine:
         if self.s.pending:
             raise GameError("请先处理当前选择")
         self.s.last_log = []
+        gold_at_spin_start = self.s.gold
+        endless_at_spin_start = bool(self.s.endless_mode)
         self._round_events = defaultdict(int)
         self._round_event_values = defaultdict(int)
         self._removed_values = []
@@ -789,6 +832,15 @@ class GameEngine:
             self.emit("order_book_used")
         self.s.gold += income
         self.s.stats["last_income"] = income
+        round_gold = max(0, int(self.s.gold - gold_at_spin_start))
+        self.s.stats["last_round_gold"] = round_gold
+        self.s.stats["highest_single_turn_gold"] = max(
+            int(self.s.stats.get("highest_single_turn_gold", 0)), round_gold
+        )
+        if endless_at_spin_start:
+            self.s.stats["highest_endless_single_turn_gold"] = max(
+                int(self.s.stats.get("highest_endless_single_turn_gold", 0)), round_gold
+            )
         self.s.last_log.insert(0, f"第{self.s.spin}回合：成分与道具合计 {income:+d}g。")
         self.s.last_board = [
             {"slot": i + 1, "coord": list(self._coords[i]), "uid": inst.uid, "id": inst.def_id, "name": self.catalog.ingredients[inst.def_id]["name"], "value": self._values[i]}
@@ -796,7 +848,7 @@ class GameEngine:
         ]
         self._decay_flags()
         interval = self.slag_interval(self.s.difficulty)
-        if interval and self.s.order_index < 11 and self.s.spin % interval == 0:
+        if interval and (self.s.endless_mode or self.s.order_index < 11) and self.s.spin % interval == 0:
             self.add_ingredient("slag")
             self.s.last_log.append("难度规则向成分池加入1个废渣。")
         if self.s.status == "playing":
@@ -966,7 +1018,9 @@ class GameEngine:
         elif script == "mercenary":
             targets = [n for n in neighbors if self._has_tag(self._board[n], "monster")]
             if targets:
-                self._remove(self._board[targets[0]], "killed", targets[0]); self._gain_gold(10, "佣兵"); self._remove(inst, "used", index)
+                self._remove(self._board[targets[0]], "killed", targets[0])
+                self._gain_gold(int(definition.get("reward_gold", 10)), "佣兵")
+                self._remove(inst, "used", index)
         elif script == "warrior":
             for n in list(neighbors):
                 target = self._board[n]
@@ -1450,7 +1504,6 @@ class GameEngine:
                 self.s.last_log.append(f"炼金银行存入{deposit}g。")
         self.check_essences()
         if "double_ledger" in self.s.items: self.s.flags["double_next_income"] = True
-        if completed >= 12 and self._final_order_for(completed, self.s.difficulty) is None: self.s.status = "won"
         token_amounts = self.token_reward_amounts(self.s.difficulty)
         if completed >= 4 and completed % 2 == 0:
             for token, token_amount in token_amounts.items(): self._gain_token(token, token_amount, "订单周期奖励")
@@ -1460,13 +1513,59 @@ class GameEngine:
         for _ in range(essence_tokens):
             choice = self.make_choice("essence", source="essence_token")
             if choice.offers: self.s.pending.append(choice)
-        if self.s.status == "won":
+        if self.s.endless_mode:
+            self._advance_endless_order()
+            self.s.last_log.append(
+                f"完成无限订单{self.s.endless_order - 1}，支付{amount}g；下一份无限订单需要{self.s.endless_target}g。"
+            )
+        elif self._mainline_complete(completed, self.s.difficulty):
+            self.s.pending.append(
+                PendingChoice(
+                    kind="run_end",
+                    offers=["end_run", "enter_endless"],
+                    can_skip=False,
+                    source="mainline_complete",
+                )
+            )
+            self.s.last_log.append("主线订单已完成：请选择结束本局或进入无限模式。")
+        elif self.s.status == "won":
             self.s.last_log.append(f"已完成第{completed}份订单：本局胜利。仍可查看状态与库存。")
         else:
             self.s.flags.pop("next_order_penalty", None)
             _, spins = self.current_order()
             self.s.spins_left = spins
             self.s.last_log.append(f"完成第{completed}份订单，支付{amount}g。")
+
+    def _advance_endless_order(self) -> None:
+        """Advance an already-active infinite run after a paid order."""
+        completed = int(self.s.endless_order)
+        self.s.stats["endless_orders_completed"] = int(
+            self.s.stats.get("endless_orders_completed", 0)
+        ) + 1
+        self.s.endless_order = completed + 1
+        self.s.endless_target = self.next_endless_target(self.s.endless_target)
+        self.s.stats["highest_endless_order"] = max(
+            int(self.s.stats.get("highest_endless_order", 0)), self.s.endless_order
+        )
+        self.s.flags.pop("next_order_penalty", None)
+        self.s.spins_left = 10
+
+    def _resolve_run_end_choice(self, selected: str) -> None:
+        if selected == "end_run":
+            self.s.status = "won"
+            self.s.last_log.append("已完成主线订单：本局胜利。")
+            return
+        if selected != "enter_endless":
+            raise GameError("无效的结算模式选择")
+        self.s.endless_mode = True
+        self.s.endless_order = 1
+        self.s.endless_target = 1000
+        self.s.spins_left = 10
+        self.s.flags.pop("next_order_penalty", None)
+        self.s.stats["highest_endless_order"] = max(
+            int(self.s.stats.get("highest_endless_order", 0)), 1
+        )
+        self.s.last_log.append("已进入无限模式：无限订单1，需要1000g，限时10回合。")
 
     def _order_rewards(self, completed: int) -> list[PendingChoice]:
         rewards: list[PendingChoice] = []
@@ -1494,6 +1593,9 @@ class GameEngine:
             label = self.catalog.ingredients[selected]["name"]
         elif choice.kind == "item":
             self.add_item(selected); label = self.catalog.items[selected]["name"]
+        elif choice.kind == "run_end":
+            self._resolve_run_end_choice(selected)
+            label = RUN_END_OPTIONS[selected]["name"]
         else:
             self.add_essence(selected); label = self.catalog.essences[selected]["name"]
         self.s.last_log = [f"选择了{label}。"] + self.s.last_log[-3:]
@@ -1515,6 +1617,8 @@ class GameEngine:
         if not self.s.pending: raise GameError("当前没有待选奖励")
         if self.s.tokens.get("roll", 0) <= 0: raise GameError("没有Roll Token")
         old = self.s.pending[0]
+        if old.kind == "run_end":
+            raise GameError("结算模式选择不能重调")
         if old.kind == "essence": raise GameError("精粹选择不能重调")
         self.s.tokens["roll"] -= 1; self.emit("token_spent"); self.emit("reroll")
         new = self.make_choice(old.kind, count=len(old.offers), source=old.source, can_skip=old.can_skip, guarantee_rarity=old.minimum_rarity, tag_filter=old.tag_filter)
@@ -1756,11 +1860,23 @@ class GameEngine:
             "pool_size": len(self.s.ingredients), "board_capacity": 21 if self.s.expanded else 20,
             "tokens": dict(self.s.tokens), "items": list(self.s.items), "essences": list(self.s.essences),
             "pending": None if not choice else {"kind":choice.kind,"offers":list(choice.offers),"can_skip":choice.can_skip,"source":choice.source,"tag_filter":choice.tag_filter},
+            "awaiting_mode_choice": bool(choice and choice.kind == "run_end"),
+            "endless_mode": bool(self.s.endless_mode),
+            "endless_order": int(self.s.endless_order),
+            "endless_target": int(self.s.endless_target),
+            "highest_endless_order": int(self.s.stats.get("highest_endless_order", 0)),
+            "endless_orders_completed": int(self.s.stats.get("endless_orders_completed", 0)),
+            "highest_endless_single_turn_gold": int(self.s.stats.get("highest_endless_single_turn_gold", 0)),
+            "highest_single_turn_gold": int(self.s.stats.get("highest_single_turn_gold", 0)),
             "last_board": list(self.s.last_board), "last_log": list(self.s.last_log),
         }
 
     def _definition_view(self, kind: str, def_id: str) -> dict[str, Any]:
         """Return a JSON-safe copy of a catalog definition for agent clients."""
+        if kind == "run_end":
+            if def_id not in RUN_END_OPTIONS:
+                raise GameError(f"unknown run-end option: {def_id}")
+            return dict(RUN_END_OPTIONS[def_id])
         if kind == "ingredient":
             definition = self.catalog.ingredients[def_id]
         elif kind == "item":
@@ -1786,7 +1902,7 @@ class GameEngine:
             actions.extend(f"choose {index}" for index in range(1, len(choice.offers) + 1))
             if choice.can_skip:
                 actions.append("skip")
-            if choice.kind != "essence" and self.s.tokens.get("roll", 0) > 0:
+            if choice.kind not in {"essence", "run_end"} and self.s.tokens.get("roll", 0) > 0:
                 actions.append("reroll")
             return actions
         actions.append("spin")
@@ -1819,7 +1935,7 @@ class GameEngine:
                 specs.append({"action": "choose", "index": index, "id": def_id})
             if choice.can_skip:
                 specs.append({"action": "skip"})
-            if choice.kind != "essence" and self.s.tokens.get("roll", 0) > 0:
+            if choice.kind not in {"essence", "run_end"} and self.s.tokens.get("roll", 0) > 0:
                 specs.append({"action": "reroll"})
             return specs
         specs.append({"action": "spin"})
@@ -1903,6 +2019,9 @@ class GameEngine:
                     "amount": amount,
                     "spins_left": state.spins_left,
                     "spins_total": total_spins,
+                    "endless_mode": bool(state.endless_mode),
+                    "endless_order": int(state.endless_order),
+                    "endless_target": int(state.endless_target),
                 },
                 "ingredients": ingredients,
                 "items_detail": items,

@@ -11,6 +11,16 @@ from .engine import GameEngine, GameError
 from .model import GameState, PendingChoice
 
 
+POOL_GROWTH_SOURCES = (
+    "active_choice",
+    "automatic_generation",
+    "copy",
+    "item_generation",
+    "periodic_slag",
+    "other",
+)
+
+
 MASK64 = (1 << 64) - 1
 
 
@@ -82,6 +92,7 @@ class HeuristicStrategy(SimulationStrategy):
         origins: Counter[str] = Counter()
         generator_tags: Counter[str] = Counter()
         mechanism_tags: Counter[str] = Counter()
+        sink_tags: Counter[str] = Counter()
         for instance in engine.s.ingredients:
             definition = engine.catalog.ingredients.get(instance.def_id, {})
             tags = definition.get("tags", [])
@@ -97,6 +108,18 @@ class HeuristicStrategy(SimulationStrategy):
                     generator_tags[str(spec["tag"])] += 1
                 if spec.get("id"):
                     generator_tags.update(self._tags_for(engine, str(spec["id"])))
+            value_spec = definition.get("value")
+            if isinstance(value_spec, dict):
+                for key in ("if_adjacent_tag", "count_tag"):
+                    if value_spec.get(key):
+                        sink_tags[str(value_spec[key])] += 1
+                for target_id in value_spec.get("if_adjacent_ids", []) or []:
+                    sink_tags.update(self._tags_for(engine, str(target_id)))
+            aura = definition.get("aura")
+            if isinstance(aura, dict):
+                for key in ("tag", "target_tag", "count_tag"):
+                    if aura.get(key):
+                        sink_tags[str(aura[key])] += 1
         primary = [tag for tag, _ in tag_counts.most_common(3)]
         core = [tag for tag, count in tag_counts.items() if count >= 2]
         mechanism = sorted(set(generator_tags) | set(mechanism_tags))
@@ -107,6 +130,7 @@ class HeuristicStrategy(SimulationStrategy):
             "core_tags": sorted(core),
             "generator_tags": dict(generator_tags),
             "mechanism_tags": mechanism,
+            "sink_tags": sorted(sink_tags),
             "origin_counts": dict(origins),
             "generator_count": sum(generator_tags.values()),
         }
@@ -145,20 +169,84 @@ class HeuristicStrategy(SimulationStrategy):
             "unknown": 1.0,
         }.get(origin, 1.0)
 
+    def _generation_profile(self, row: dict[str, Any]) -> float:
+        """Estimate entries added by a generator over the remaining horizon.
+
+        This is deliberately an estimate for scoring only.  It never draws
+        RNG and does not alter the engine's generation behavior.  The profile
+        lets v2 price future pool growth instead of treating every generator
+        as equally bad (or equally good).
+        """
+        horizon = 10.0
+        expected = 0.0
+        periodic = row.get("periodic_spawn")
+        if isinstance(periodic, dict):
+            every = max(1.0, float(periodic.get("every", 1)))
+            amount = max(1.0, float(periodic.get("amount", 1)))
+            expected += horizon / every * amount
+        chance = row.get("chance_spawn")
+        if isinstance(chance, dict):
+            probability = max(0.0, min(1.0, float(chance.get("chance", 0.0))))
+            amount = max(1.0, float(chance.get("amount", 1)))
+            expected += horizon * probability * amount
+        each_spin = row.get("spawn_each_spin")
+        if isinstance(each_spin, dict):
+            amount = max(1.0, float(each_spin.get("amount", 1)))
+            expected += horizon * amount
+        return min(20.0, expected)
+
+    def _generated_tags(self, engine: GameEngine, row: dict[str, Any]) -> set[str]:
+        tags: set[str] = set()
+        for field in self._GENERATOR_FIELDS:
+            spec = row.get(field)
+            if not isinstance(spec, dict):
+                continue
+            if spec.get("tag"):
+                tags.add(str(spec["tag"]))
+            if spec.get("id"):
+                tags.update(self._tags_for(engine, str(spec["id"])))
+        return tags
+
+    def _generator_synergy(self, engine: GameEngine, row: dict[str, Any]) -> float:
+        """Score whether generated entries have an observed build sink.
+
+        The score is based only on tags and effect references already present
+        in the build.  It intentionally has no card-ID exceptions: generated
+        products are favored when they are core tags, feed an active mechanic,
+        or match an explicit adjacent/count/aura reference.
+        """
+        generated = self._generated_tags(engine, row)
+        if not generated:
+            return 0.0
+        state = self.build_state(engine)
+        core = set(state["core_tags"])
+        primary = set(state["primary_tags"])
+        mechanisms = set(state["mechanism_tags"])
+        sinks = set(state.get("sink_tags", []))
+        score = 0.0
+        score += 2.5 * len(generated.intersection(core))
+        score += 2.0 * len(generated.intersection(sinks))
+        score += 1.25 * len(generated.intersection(mechanisms))
+        score += 0.5 * len(generated.intersection(primary - core))
+        return min(6.0, score)
+
     def _candidate_pool_cost(self, engine: GameEngine, def_id: str, origin: str = "active_choice") -> float:
         row = engine.catalog.ingredients[def_id]
         tags = set(row.get("tags", []))
         state = self.build_state(engine)
         fit = len(tags.intersection(set(state["core_tags"]) | set(state["primary_tags"])))
-        generator = any(row.get(field) for field in self._GENERATOR_FIELDS)
         cost = self._pool_pressure(len(engine.s.ingredients)) * self._origin_factor(origin)
         cost *= self._release_factor(row)
         if fit:
             cost *= max(0.25, 1.0 - 0.2 * fit)
-        if generator:
-            # A generator can be the reason a larger pool is intentional;
-            # its own occupancy is still non-zero, just discounted.
-            cost *= 0.55
+        generation = self._generation_profile(row)
+        if generation:
+            # Continuous generators have a future occupancy cost.  Existing
+            # sinks/core tags rebate that cost, while an unconnected generator
+            # is increasingly unattractive once the pool is already large.
+            synergy = self._generator_synergy(engine, row)
+            synergy_factor = 0.20 if synergy >= 4.0 else 0.45 if synergy >= 2.0 else 1.0
+            cost += self._pool_pressure(len(engine.s.ingredients)) * min(5.0, generation * 0.45) * synergy_factor
         value_spec = row.get("value") if isinstance(row.get("value"), dict) else {}
         # Count/aura-style mechanisms need a sufficiently populated pool to
         # pay off.  Keep their occupancy cost lower without naming any card.
@@ -378,7 +466,8 @@ class HeuristicStrategy(SimulationStrategy):
             components["pool_cost"] = -self._candidate_pool_cost(engine, def_id)
             components["pool_pressure"] = components["pool_cost"]
             if any(row.get(field) for field in self._GENERATOR_FIELDS):
-                components["source_fit"] += 1.5 if existing_tags.intersection(tags) else 0.5
+                generator_synergy = self._generator_synergy(engine, row)
+                components["generation_synergy"] = generator_synergy
             return components
 
         if kind == "item":
@@ -461,41 +550,116 @@ class HeuristicV2Strategy(HeuristicStrategy):
     """A more conservative player model that skips cards and controls the pool.
 
     v2 deliberately reuses v1's data-derived scoring and archetype detection.
-    Its only policy change is willingness to accept ingredient choices: once
-    the pool is above 20, ordinary low-confidence choices are skipped; above
-    26, deletion is preferred before the next spin whenever a generic
-    low-retention entry can be released. No definition IDs are special-cased
-    and the strategy never consumes RNG of its own.
+    Its policy change is willingness to accept ingredient choices: once the
+    pool is above 20, ordinary low-confidence choices are skipped; at 25 and
+    above, deletion is preferred before the next spin whenever a generic
+    low-retention entry can be released. Unconnected generators also receive
+    a future-growth penalty before selection, while connected/releasable
+    generators are protected by generic tag-based exceptions. No definition
+    IDs are special-cased and the strategy never consumes RNG of its own.
     """
 
     name = "heuristic-v2"
+
+    def _generator_penalty(self, engine: GameEngine, row: dict[str, Any]) -> float:
+        """Price an unconnected generator before it can win a choice.
+
+        The penalty is generic and derived from expected future additions and
+        observed tag sinks.  It is deliberately smaller for high-rarity,
+        releasable, or strongly connected generators, so generation is not
+        treated as universally weak.
+        """
+        expected = self._generation_profile(row)
+        if expected <= 0.0:
+            return 0.0
+        synergy = self._generator_synergy(engine, row)
+        if synergy < 1.0:
+            penalty = min(8.0, 2.0 + expected * 0.75)
+        elif synergy < 2.0:
+            penalty = min(4.0, expected * 0.35)
+        else:
+            penalty = 0.0
+        pool_size = len(engine.s.ingredients)
+        if pool_size >= 20:
+            penalty += min(5.0, (pool_size - 19) * 0.15 * max(1.0, expected))
+        if self._release_factor(row) < 0.9:
+            penalty *= 0.35
+        if int(row.get("rarity", 1)) >= 3:
+            penalty *= 0.60
+        return penalty
+
+    def _v2_score(self, engine: GameEngine, kind: str, def_id: str) -> float:
+        score = self.score(engine, kind, def_id)
+        if kind == "ingredient":
+            score -= self._generator_penalty(engine, engine.catalog.ingredients[def_id])
+        return score
+
+    def _is_exception_candidate(self, engine: GameEngine, def_id: str) -> bool:
+        """Return whether a candidate deserves protection in a large pool."""
+        row = engine.catalog.ingredients[def_id]
+        components = self.score_components(engine, "ingredient", def_id)
+        fit = self._archetype_fit(engine, row)
+        generation_synergy = self._generator_synergy(engine, row)
+        immediate_long_term = components.get("immediate", 0.0) + components.get("long_term", 0.0)
+        generator = self._generation_profile(row) > 0.0
+        rarity_exception = int(row.get("rarity", 1)) >= 3 and (
+            not generator or generation_synergy >= 1.0 or immediate_long_term >= 8.0
+        )
+        return (
+            rarity_exception
+            or fit >= 2.5
+            or generation_synergy >= 2.0
+            or self._release_factor(row) < 0.9
+            or immediate_long_term >= 8.0
+        )
 
     def _acceptance_threshold(self, engine: GameEngine, def_id: str) -> float:
         pool_size = len(engine.s.ingredients)
         if pool_size <= 20:
             return float("-inf")
-        if pool_size <= 26:
-            threshold = 6.5 + (pool_size - 20) * 0.35
+        if pool_size < 25:
+            threshold = 8.0 + (pool_size - 20) * 0.5
         else:
-            threshold = 9.0 + min(4.0, (pool_size - 26) * 0.6)
+            threshold = 10.5 + min(5.0, (pool_size - 25) * 0.7)
         fit = self._archetype_fit(engine, engine.catalog.ingredients[def_id])
-        return threshold - min(2.5, fit * 0.55)
+        generation_synergy = self._generator_synergy(engine, engine.catalog.ingredients[def_id])
+        return threshold - min(3.5, fit * 0.7 + generation_synergy * 0.4)
 
     def choose(self, engine: GameEngine, choice: PendingChoice) -> int | None:
         if not choice.offers:
             return None
-        selected = super().choose(engine, choice)
-        if selected is None or choice.kind != "ingredient" or not choice.can_skip:
+        scored = [
+            (self._v2_score(engine, choice.kind, def_id), def_id, index)
+            for index, def_id in enumerate(choice.offers, 1)
+        ]
+        _, selected_id, selected = max(scored, key=lambda row: (row[0], row[1]))
+        if choice.kind != "ingredient" or not choice.can_skip:
             return selected
-        selected_id = choice.offers[selected - 1]
-        score = self.score(engine, "ingredient", selected_id)
-        future = self._long_term_ingredient_value(
-            engine, engine.catalog.ingredients[selected_id]
-        )
-        fit = self._archetype_fit(engine, engine.catalog.ingredients[selected_id])
-        if len(engine.s.ingredients) > 20 and score < self._acceptance_threshold(engine, selected_id):
+        row = engine.catalog.ingredients[selected_id]
+        if ("waste" in row.get("tags", []) or not row.get("removable", True)):
             return None
-        if len(engine.s.ingredients) > 26 and future < 4.0 and fit < 3.0:
+        score = self._v2_score(engine, "ingredient", selected_id)
+        future = self._long_term_ingredient_value(
+            engine, row
+        )
+        fit = self._archetype_fit(engine, row)
+        pool_size = len(engine.s.ingredients)
+        exception = self._is_exception_candidate(engine, selected_id)
+        if (
+            pool_size >= 15
+            and self._generation_profile(row) > 0.0
+            and self._generator_penalty(engine, row) > 0.0
+            and not exception
+            and future < 8.0
+        ):
+            return None
+        if pool_size > 20 and score < self._acceptance_threshold(engine, selected_id) and not exception:
+            return None
+        # At 20-24, ordinary level-1 filler should usually be skipped unless
+        # it directly advances an observed build or pays off immediately.
+        if 20 < pool_size < 25 and int(row.get("rarity", 1)) <= 1 and not exception:
+            return None
+        if pool_size >= 25 and future < 4.0 and fit < 3.0 and not exception:
             return None
         return selected
 
@@ -505,7 +669,7 @@ class HeuristicV2Strategy(HeuristicStrategy):
         if engine.s.tokens.get("roll", 0) <= 0:
             return False
         scored = [
-            (self.score(engine, "ingredient", def_id), def_id)
+            (self._v2_score(engine, "ingredient", def_id), def_id)
             for def_id in choice.offers
         ]
         best, best_id = max(scored, key=lambda row: (row[0], row[1]))
@@ -513,11 +677,11 @@ class HeuristicV2Strategy(HeuristicStrategy):
             return super().should_reroll(engine, choice)
         fit = self._archetype_fit(engine, engine.catalog.ingredients[best_id])
         threshold = self._acceptance_threshold(engine, best_id)
-        return best < threshold and fit < 3.5
+        return best < threshold and fit < 3.5 and not self._is_exception_candidate(engine, best_id)
 
     def removal_index(self, engine: GameEngine) -> int | None:
         pool_size = len(engine.s.ingredients)
-        if engine.s.tokens.get("remove", 0) <= 0 or pool_size <= 26:
+        if engine.s.tokens.get("remove", 0) <= 0 or pool_size < 25:
             return None
         candidates = []
         for index, instance in enumerate(engine.s.ingredients, 1):
@@ -528,7 +692,7 @@ class HeuristicV2Strategy(HeuristicStrategy):
             origin = str(instance.flags.get("_sim_origin", "unknown"))
             cost = self._candidate_pool_cost(engine, instance.def_id, origin)
             fit = self._archetype_fit(engine, row)
-            retention = sum(components.values()) + fit
+            retention = self._v2_score(engine, "ingredient", instance.def_id) + fit
             deletion_score = retention - cost * 2.5
             if fit >= 2.0 and self._long_term_ingredient_value(engine, row) >= 4.0:
                 deletion_score += 4.0
@@ -538,9 +702,12 @@ class HeuristicV2Strategy(HeuristicStrategy):
         weakest_score, weakest_cost, weakest_fit, weakest_index = min(
             candidates, key=lambda row: (row[0], row[1], row[3])
         )
-        if weakest_fit >= 3.0 and weakest_score >= 5.0:
+        weakest_id = engine.s.ingredients[weakest_index - 1].def_id
+        if self._is_exception_candidate(engine, weakest_id):
             return None
-        if weakest_cost >= 0.65 or weakest_score < 8.5:
+        if pool_size >= 30 and (weakest_cost >= 0.55 or weakest_score < 9.5):
+            return weakest_index
+        if pool_size >= 25 and (weakest_cost >= 1.0 or weakest_score < 8.0):
             return weakest_index
         return None
 
@@ -578,6 +745,10 @@ class GameRecord:
     strategy_events: dict[str, Any]
     death_reason: str | None
     error: str | None = None
+    endless_orders_completed: int = 0
+    highest_endless_order: int = 0
+    highest_endless_single_turn_gold: int = 0
+    highest_single_turn_gold: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -601,7 +772,7 @@ def validate_simulation_state(engine: GameEngine) -> list[str]:
         errors.append("gold<0")
     if not 1 <= state.difficulty <= 10:
         errors.append("difficulty_out_of_range")
-    if not 0 <= state.order_index <= 13:
+    if state.order_index < 0 or (not state.endless_mode and state.order_index > 13):
         errors.append("order_index_out_of_range")
     if state.spins_left < 0:
         errors.append("spins_left<0")
@@ -617,6 +788,8 @@ def validate_simulation_state(engine: GameEngine) -> list[str]:
             else engine.catalog.items
             if choice.kind == "item"
             else engine.catalog.essences
+            if choice.kind == "essence"
+            else {def_id: engine._definition_view("run_end", def_id) for def_id in choice.offers}
         )
         if any(def_id not in collection for def_id in choice.offers):
             errors.append("pending_offer_missing_definition")
@@ -673,6 +846,13 @@ def _final_attributes(engine: GameEngine, max_pool_size: int | None = None) -> d
         "rarity_multiplier": engine.current_rarity_multiplier(),
         "expanded": state.expanded,
         "event_counts": dict(state.stats.get("event_counts", {})),
+        "endless_mode": bool(state.endless_mode),
+        "endless_order": int(state.endless_order),
+        "endless_target": int(state.endless_target),
+        "endless_orders_completed": int(state.stats.get("endless_orders_completed", 0)),
+        "highest_endless_order": int(state.stats.get("highest_endless_order", 0)),
+        "highest_endless_single_turn_gold": int(state.stats.get("highest_endless_single_turn_gold", 0)),
+        "highest_single_turn_gold": int(state.stats.get("highest_single_turn_gold", 0)),
     }
 
 
@@ -715,8 +895,10 @@ def simulate_game(
         "choices": [],
         "pool_curve": [],
         "pool_events": [],
+        "order_outcomes": [],
         "final_order_curve": [],
     }
+    pool_source_counts: Counter[str] = Counter({source: 0 for source in POOL_GROWTH_SOURCES})
 
     for instance in engine.s.ingredients:
         instance.flags.setdefault("_sim_origin", "initial")
@@ -725,7 +907,15 @@ def simulate_game(
         method = getattr(policy, "build_state", None)
         return method(engine) if method else {"pool_size": len(engine.s.ingredients)}
 
-    def record_pool_delta(before: dict[int, str], source: str, action: str, selected_id: str | None = None) -> None:
+    def record_pool_delta(
+        before: dict[int, str],
+        source: str,
+        action: str,
+        selected_id: str | None = None,
+        *,
+        growth_source: str | None = None,
+        copied_count: int = 0,
+    ) -> None:
         current = {instance.uid: instance for instance in engine.s.ingredients}
         generator_ids: set[str] = set()
         generator_tags: set[str] = set()
@@ -745,6 +935,16 @@ def simulate_game(
             tags = set(engine.catalog.ingredients.get(def_id, {}).get("tags", []))
             return bool(tags.intersection(generator_tags))
 
+        new_instances = [
+            (uid, instance)
+            for uid, instance in current.items()
+            if before.get(uid) is None
+        ]
+        # ``copied`` is an event count rather than a UID-level marker in the
+        # engine.  It is sufficient for the requested source totals: reserve
+        # that many newly-added instances for the copy bucket, while the
+        # remaining additions retain their normal source classification.
+        copy_remaining = max(0, min(int(copied_count), len(new_instances)))
         for uid, instance in current.items():
             previous_id = before.get(uid)
             if previous_id is not None and previous_id != instance.def_id:
@@ -756,6 +956,20 @@ def simulate_game(
                 continue
             if previous_id is not None:
                 continue
+            if copy_remaining:
+                growth_origin = "copy"
+                copy_remaining -= 1
+            elif growth_source == "item_generation":
+                growth_origin = "item_generation"
+            elif source == "active_choice" and selected_id == instance.def_id:
+                growth_origin = "active_choice"
+            elif source == "spin" and instance.def_id == "slag":
+                growth_origin = "periodic_slag"
+            elif source == "spin":
+                growth_origin = "automatic_generation"
+            else:
+                growth_origin = "other"
+
             if source == "spin":
                 # Only classify a spin-time addition as summon/periodic when
                 # its definition matches an actual generator target.  This
@@ -771,9 +985,11 @@ def simulate_game(
             else:
                 origin = "one_time_temporary" if "potion" in engine.catalog.ingredients[instance.def_id].get("tags", []) else "conversion"
             instance.flags["_sim_origin"] = origin
+            pool_source_counts[growth_origin] += 1
             definition = engine.catalog.ingredients[instance.def_id]
             strategy_events["pool_events"].append({
                 "uid": uid, "id": instance.def_id, "source": origin, "action": action,
+                "growth_source": growth_origin,
                 "rarity": int(definition.get("rarity", 1)), "base": float(definition.get("base", 0)),
                 "tags": list(definition.get("tags", [])), "pool_size": len(current),
             })
@@ -842,6 +1058,22 @@ def simulate_game(
         try:
             if engine.s.pending:
                 choice = engine.s.pending[0]
+                if choice.kind == "run_end":
+                    # Batch balance runs retain the historical terminal
+                    # semantics: choose "end run" instead of entering a
+                    # non-terminating infinite branch.
+                    engine.choose(1)
+                    strategy_events["choices"].append({
+                        "kind": choice.kind,
+                        "offers": {def_id: {"score": 0.0, "components": {}} for def_id in choice.offers},
+                        "selected": "end_run",
+                        "pool_size": len(engine.s.ingredients),
+                        "build_state": build_state(),
+                    })
+                    if on_choice:
+                        on_choice(engine, choice, "end_run")
+                    action_count += 1
+                    continue
                 if policy.should_reroll(engine, choice):
                     before_scores = [policy.score(engine, choice.kind, def_id) for def_id in choice.offers]
                     before_max = max(before_scores, default=0.0)
@@ -897,11 +1129,32 @@ def simulate_game(
                         raise GameError("模拟策略返回了越界候选序号")
                     selected_id = choice.offers[index - 1]
                     engine.choose(index)
+                    if choice.kind == "ingredient":
+                        # Ingredient choices created by an item (for example
+                        # large_reactor) are still actively picked by the
+                        # strategy, but their pool growth belongs to the
+                        # item-generation bucket. PendingChoice.source is
+                        # the shared data-driven provenance field; no item ID
+                        # is special-cased here.
+                        ingredient_growth_source = (
+                            "item_generation"
+                            if choice.source in engine.catalog.items
+                            else "active_choice"
+                        )
+                    else:
+                        ingredient_growth_source = None
                     record_pool_delta(
                         before_choice_uids,
                         "active_choice" if choice.kind == "ingredient" else "mechanism",
                         f"choose:{choice.kind}",
                         selected_id=selected_id,
+                        growth_source=(
+                            ingredient_growth_source
+                            if ingredient_growth_source is not None
+                            else "item_generation"
+                            if choice.kind == "item"
+                            else "other"
+                        ),
                     )
                     category = _content_category(engine.catalog, choice.kind, selected_id)
                     if category:
@@ -957,7 +1210,7 @@ def simulate_game(
                         "origin": str(removed.flags.get("_sim_origin", "unknown")),
                         "build_state": build_state(),
                     })
-                    record_pool_delta(before_remove_uids, "remove", "delete")
+                    record_pool_delta(before_remove_uids, "remove", "delete", growth_source="other")
                     capture_acquisitions()
                     max_pool_size = max(max_pool_size, len(engine.s.ingredients))
                     action_count += 1
@@ -971,8 +1224,15 @@ def simulate_game(
                 order_amount_before_spin, _ = engine.current_order()
                 gold_before_spin = engine.s.gold
                 before_spin_uids = {instance.uid: instance.def_id for instance in engine.s.ingredients}
+                copied_before_spin = int(engine.s.stats.get("event_counts", {}).get("copied", 0))
                 engine.spin()
-                record_pool_delta(before_spin_uids, "spin", "spin")
+                copied_after_spin = int(engine.s.stats.get("event_counts", {}).get("copied", 0))
+                record_pool_delta(
+                    before_spin_uids,
+                    "spin",
+                    "spin",
+                    copied_count=max(0, copied_after_spin - copied_before_spin),
+                )
                 capture_acquisitions()
                 strategy_events["pool_curve"].append({
                     "spin": engine.s.spin,
@@ -989,6 +1249,26 @@ def simulate_game(
                         "gold_after_spin": int(engine.s.gold),
                         "spins_left_after": int(engine.s.spins_left),
                         "status_after": engine.s.status,
+                    })
+                if engine.s.order_index > order_before_spin:
+                    for completed_order in range(order_before_spin + 1, engine.s.order_index + 1):
+                        strategy_events["order_outcomes"].append({
+                            "order": completed_order,
+                            "result": "completed",
+                            "target": int(order_amount_before_spin),
+                            "gold_before": int(gold_before_spin),
+                            "gold_after": int(engine.s.gold),
+                            "gold_gap": 0,
+                        })
+                elif engine.s.status == "lost":
+                    death_order = order_before_spin + 1
+                    strategy_events["order_outcomes"].append({
+                        "order": death_order,
+                        "result": "died",
+                        "target": int(order_amount_before_spin),
+                        "gold_before": int(gold_before_spin),
+                        "gold_after": int(engine.s.gold),
+                        "gold_gap": max(0, int(order_amount_before_spin) - int(engine.s.gold)),
                     })
                 max_pool_size = max(max_pool_size, len(engine.s.ingredients))
                 if on_spin:
@@ -1037,6 +1317,7 @@ def simulate_game(
     ]
     held_essences = list(state.essences)
     strategy_events["final_build_state"] = build_state()
+    strategy_events["pool_source_counts"] = dict(pool_source_counts)
     strategy_events["pool_origin_counts"] = dict(Counter(
         str(instance.flags.get("_sim_origin", "unknown")) for instance in state.ingredients
     ))
@@ -1074,6 +1355,10 @@ def simulate_game(
         strategy_events=strategy_events,
         death_reason=_failure_reason(state, status, error),
         error=error,
+        endless_orders_completed=int(state.stats.get("endless_orders_completed", 0)),
+        highest_endless_order=int(state.stats.get("highest_endless_order", 0)),
+        highest_endless_single_turn_gold=int(state.stats.get("highest_endless_single_turn_gold", 0)),
+        highest_single_turn_gold=int(state.stats.get("highest_single_turn_gold", 0)),
     )
 
 
@@ -1137,7 +1422,11 @@ class BatchAccumulator:
         self.delete_events: list[dict[str, Any]] = []
         self.pool_origin_counts: Counter[str] = Counter()
         self.pool_event_counts: Counter[str] = Counter()
+        self.pool_growth_source_counts: Counter[str] = Counter({source: 0 for source in POOL_GROWTH_SOURCES})
         self.pool_event_sizes: list[float] = []
+        self.order_reached: Counter[int] = Counter()
+        self.order_died: Counter[int] = Counter()
+        self.order_death_gap_sum: Counter[int] = Counter()
         self.growth: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
         self.total_rolls = 0
         self.total_deletes = 0
@@ -1202,11 +1491,24 @@ class BatchAccumulator:
                 strategy_events={},
                 death_reason=record.death_reason,
                 error=record.error,
+                endless_orders_completed=record.endless_orders_completed,
+                highest_endless_order=record.highest_endless_order,
+                highest_endless_single_turn_gold=record.highest_endless_single_turn_gold,
+                highest_single_turn_gold=record.highest_single_turn_gold,
             ))
         self.max_pool_sizes.append(int(record.final_attributes.get("max_pool_size", len(record.held_ingredients) + len(record.held_equipment))))
         self.roll_events.extend(record.strategy_events.get("rolls", []))
         self.delete_events.extend(record.strategy_events.get("deletes", []))
         self.pool_origin_counts.update(record.strategy_events.get("pool_origin_counts", {}))
+        self.pool_growth_source_counts.update(record.strategy_events.get("pool_source_counts", {}))
+        for outcome in record.strategy_events.get("order_outcomes", []):
+            order = int(outcome.get("order", 0))
+            if order <= 0:
+                continue
+            self.order_reached[order] += 1
+            if outcome.get("result") == "died":
+                self.order_died[order] += 1
+                self.order_death_gap_sum[order] += max(0, int(outcome.get("gold_gap", 0)))
         for event in record.strategy_events.get("pool_events", []):
             self.pool_event_counts[str(event.get("source", "unknown"))] += 1
             if event.get("pool_size") is not None:
@@ -1345,6 +1647,20 @@ class BatchAccumulator:
             for record in self.records
             if record.death_reason is not None
         )
+        max_order = 13 if difficulty == 10 else 12
+        order_progression = []
+        for order in range(1, max_order + 1):
+            reached = self.order_reached[order]
+            died = self.order_died[order]
+            order_progression.append({
+                "order": order,
+                "reached": reached,
+                "died": died,
+                "conditional_death_rate": died / reached if reached else 0.0,
+                "average_gold_gap_at_death": (
+                    self.order_death_gap_sum[order] / died if died else None
+                ),
+            })
         anomalies = []
         for category, rows in self.content.items():
             for row in rows.values():
@@ -1381,6 +1697,10 @@ class BatchAccumulator:
             "average_final_gold": sum(record.gold for record in self.records) / self.games if self.games else 0.0,
             "average_spins": sum(record.spins for record in self.records) / self.games if self.games else 0.0,
             "average_orders_completed": sum(record.orders_completed for record in self.records) / self.games if self.games else 0.0,
+            "endless_orders_completed": sum(record.endless_orders_completed for record in self.records),
+            "highest_endless_order": max((record.highest_endless_order for record in self.records), default=0),
+            "highest_endless_single_turn_gold": max((record.highest_endless_single_turn_gold for record in self.records), default=0),
+            "highest_single_turn_gold": max((record.highest_single_turn_gold for record in self.records), default=0),
             "average_max_pool_size": sum(self.max_pool_sizes) / self.games if self.games else 0.0,
             "pool_size_distribution": {
                 "0-20": sum(size <= 20 for size in self.max_pool_sizes),
@@ -1392,12 +1712,14 @@ class BatchAccumulator:
             "average_deletes": self.total_deletes / self.games if self.games else 0.0,
             "pool_origin_counts": dict(self.pool_origin_counts),
             "pool_event_counts": dict(self.pool_event_counts),
+            "pool_growth_source_counts": dict(self.pool_growth_source_counts),
             "average_pool_event_size": sum(self.pool_event_sizes) / len(self.pool_event_sizes) if self.pool_event_sizes else 0.0,
             "roll_effective_rate": (
                 sum(bool(event.get("effective")) for event in self.roll_events) / len(self.roll_events)
                 if self.roll_events else None
             ),
             "death_reasons": dict(reason_counts),
+            "order_progression": order_progression,
         }
         return SimulationReport(
             base_seed=base_seed,
@@ -1517,6 +1839,10 @@ class SimulationReport:
             f"| 平均最终金币 | {summary['average_final_gold']:.2f}g |",
             f"| 平均旋转数 | {summary['average_spins']:.2f} |",
             f"| 平均完成订单 | {summary['average_orders_completed']:.2f} |",
+            f"| 完成无限订单总数 | {summary['endless_orders_completed']} |",
+            f"| 最高无限订单 | {summary['highest_endless_order']} |",
+            f"| 无限模式最高单回合金币 | {summary['highest_endless_single_turn_gold']}g |",
+            f"| 全局最高单回合金币 | {summary['highest_single_turn_gold']}g |",
             f"| 平均最大池大小 | {summary['average_max_pool_size']:.2f} |",
             f"| 平均 Roll 次数 | {summary['average_rolls']:.2f} |",
             f"| 平均删除次数 | {summary['average_deletes']:.2f} |",
@@ -1535,6 +1861,32 @@ class SimulationReport:
         ]
         for row in self.death_layers:
             lines.append(f"| {row['layer']} | {row['death_count']} | {self._pct(row['death_rate'])} |")
+
+        lines.extend(["", "## 订单级到达与死亡", ""])
+        lines.extend([
+            "| 订单 | reached | died | 条件死亡率 | 死亡时平均金币差 |",
+            "|---:|---:|---:|---:|---:|",
+        ])
+        for row in summary.get("order_progression", []):
+            gap = "—" if row["average_gold_gap_at_death"] is None else f"{row['average_gold_gap_at_death']:.2f}g"
+            lines.append(
+                f"| {row['order']} | {row['reached']} | {row['died']} | "
+                f"{self._pct(row['conditional_death_rate'])} | {gap} |"
+            )
+
+        source_labels = {
+            "active_choice": "主动抓取",
+            "automatic_generation": "成分自动生成",
+            "copy": "复制",
+            "item_generation": "物品生成",
+            "periodic_slag": "周期废渣",
+            "other": "其他来源",
+        }
+        lines.extend(["", "## 池增长来源", ""])
+        lines.extend(["| 来源 | 新增张数 |", "|---|---:|"])
+        source_counts = summary.get("pool_growth_source_counts", {})
+        for source in ("active_choice", "automatic_generation", "copy", "item_generation", "periodic_slag", "other"):
+            lines.append(f"| {source_labels[source]} (`{source}`) | {int(source_counts.get(source, 0))} |")
 
         lines.extend(["", "## 主要结束原因", ""])
         if summary["death_reasons"]:
@@ -1609,6 +1961,14 @@ class DifficultySweepReport:
                 }
                 for difficulty in sorted(self.reports)
             ],
+            "order_progression_by_difficulty": {
+                str(difficulty): self.reports[difficulty].summary.get("order_progression", [])
+                for difficulty in sorted(self.reports)
+            },
+            "pool_growth_sources_by_difficulty": {
+                str(difficulty): self.reports[difficulty].summary.get("pool_growth_source_counts", {})
+                for difficulty in sorted(self.reports)
+            },
             "adjacent_jumps": self.adjacent_jumps,
             "reports": {str(k): v.to_dict() for k, v in self.reports.items()},
             "notes": self.notes,
@@ -1648,6 +2008,36 @@ class DifficultySweepReport:
                 f"| {row['from_difficulty']} → {row['to_difficulty']} | "
                 f"{row['from_win_rate'] * 100:.2f}% | {row['to_win_rate'] * 100:.2f}% | "
                 f"{row['delta'] * 100:+.2f} 个百分点 | {row['flag']} |"
+            )
+        lines.extend(["", "## 各难度订单级诊断", ""])
+        lines.extend([
+            "| 难度 | 订单 | reached | died | 条件死亡率 | 死亡时平均金币差 |",
+            "|---:|---:|---:|---:|---:|---:|",
+        ])
+        for difficulty in sorted(self.reports):
+            for row in self.reports[difficulty].summary.get("order_progression", []):
+                gap = "—" if row["average_gold_gap_at_death"] is None else f"{row['average_gold_gap_at_death']:.2f}g"
+                lines.append(
+                    f"| {difficulty} | {row['order']} | {row['reached']} | {row['died']} | "
+                    f"{row['conditional_death_rate'] * 100:.1f}% | {gap} |"
+                )
+        lines.extend(["", "## 各难度池增长来源", ""])
+        lines.extend(["| 难度 | 主动抓取 | 成分自动生成 | 复制 | 物品生成 | 周期废渣 | 其他来源 |", "|---:|---:|---:|---:|---:|---:|---:|"])
+        source_labels = {
+            "active_choice": "主动抓取",
+            "automatic_generation": "成分自动生成",
+            "copy": "复制",
+            "item_generation": "物品生成",
+            "periodic_slag": "周期废渣",
+            "other": "其他来源",
+        }
+        for difficulty in sorted(self.reports):
+            source_counts = self.reports[difficulty].summary.get("pool_growth_source_counts", {})
+            lines.append(
+                f"| {difficulty} | " + " | ".join(
+                    str(int(source_counts.get(source, 0)))
+                    for source in source_labels
+                ) + " |"
             )
         lines.extend(["", "## 说明", ""])
         lines.extend(f"- {note}" for note in self.notes)

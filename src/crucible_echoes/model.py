@@ -59,6 +59,10 @@ class GameState:
     last_log: list[str] = field(default_factory=list)
     stats: dict[str, Any] = field(default_factory=dict)
     flags: dict[str, Any] = field(default_factory=dict)
+    # Post-mainline infinite mode is opt-in.  Defaults keep legacy saves valid.
+    endless_mode: bool = False
+    endless_order: int = 0
+    endless_target: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -73,5 +77,9 @@ class GameState:
         stats.setdefault("item_event_counts", {})
         stats.setdefault("item_trigger_counts", {})
         stats.setdefault("item_storage", {})
+        stats.setdefault("endless_orders_completed", 0)
+        stats.setdefault("highest_endless_order", 0)
+        stats.setdefault("highest_endless_single_turn_gold", 0)
+        stats.setdefault("highest_single_turn_gold", 0)
         copied["stats"] = stats
         return cls(**copied)

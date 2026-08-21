@@ -125,3 +125,11 @@ py -3 run_tests.py
 ## Credits
 
 Developed with assistance from **ChatGPT by OpenAI** and **OpenAI Codex**.
+
+## Endless mode
+
+After the final mainline order is settled, choose `end_run` to finish with
+`won`, or `enter_endless` to continue with 10-round orders starting at 1000g.
+The next target is `ceil(previous_target * 1.5)`. See
+[`docs/ENDLESS_MODE.md`](docs/ENDLESS_MODE.md) for state fields, save
+compatibility, and agent commands.

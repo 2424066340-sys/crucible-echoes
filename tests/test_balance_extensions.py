@@ -62,6 +62,10 @@ class BalanceExtensionTests(unittest.TestCase):
         self.assertGreaterEqual(int(ordinary.catalog.ingredients[high.def_id]["rarity"]), 2)
 
     def test_vein_periodic_spawn_uses_normal_and_high_quality_paths(self) -> None:
+        self.assertEqual(
+            0.50,
+            self.fresh().catalog.ingredients["vein"]["periodic_spawn"]["minimum_rarity_chance"]["chance"],
+        )
         for random_value, minimum in ((0.99, 1), (0.0, 2)):
             engine = self.fresh()
             vein = engine.add_ingredient("vein", emit=False)
@@ -148,6 +152,10 @@ class BalanceExtensionTests(unittest.TestCase):
         self.assertEqual(4, catalog.items["small_safe"]["event_bonus"]["token"])
         self.assertIn("4g", catalog.items["small_safe"]["description"])
         self.assertEqual(2, catalog.ingredients["magic_magic"]["base"])
+        self.assertEqual(2, catalog.ingredients["proliferation_core"]["base"])
+        self.assertEqual(11, catalog.ingredients["mercenary"]["reward_gold"])
+        self.assertEqual(20, catalog.ingredients["nested_chest"]["on_removed"]["gold"])
+        self.assertIn("20g", catalog.ingredients["nested_chest"]["description"])
         self.assertEqual(7, catalog.items["animal_registry"].get("first_animal_gold", 7))
         self.assertEqual(10, catalog.items["impossible_container"].get("per_spin_cap", 10))
         self.assertEqual([1, 1, 2, 2], catalog.items["large_reactor"]["on_acquire"]["fixed_ingredient_choices"])
@@ -205,6 +213,25 @@ class BalanceExtensionTests(unittest.TestCase):
         self.assertIsNotNone(cat)
         self.assertTrue(engine._remove(cat, "removed", None))
         self.assertEqual(6, engine.s.gold)
+
+    def test_mercenary_uses_data_driven_eleven_gold_reward(self) -> None:
+        engine = self.fresh()
+        mercenary = engine.add_ingredient("mercenary", emit=False)
+        monster = engine.add_ingredient("goblin", emit=False)
+        self.assertIsNotNone(mercenary)
+        self.assertIsNotNone(monster)
+        engine._board = [mercenary, monster]
+        engine._coords = [(0, 0), (0, 1)]
+        engine._run_script(0, mercenary, "mercenary")
+        self.assertEqual(11, engine.s.gold)
+        self.assertNotIn(monster.uid, {item.uid for item in engine.s.ingredients})
+
+    def test_nested_chest_pays_twenty_when_removed(self) -> None:
+        engine = self.fresh()
+        chest = engine.add_ingredient("nested_chest", emit=False)
+        self.assertIsNotNone(chest)
+        self.assertTrue(engine._remove(chest, "removed", None))
+        self.assertEqual(20, engine.s.gold)
 
     def test_spare_key_pays_four_for_each_opened_chest(self) -> None:
         engine = self.fresh()

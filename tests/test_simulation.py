@@ -64,6 +64,17 @@ class SimulationTests(unittest.TestCase):
         self.assertEqual(1, policy.removal_index(engine))
         self.assertEqual("heuristic-v2", strategy_from_name("heuristic-v2").name)
 
+    def test_heuristic_v2_is_cautious_with_unconnected_generators(self) -> None:
+        engine = GameEngine()
+        engine.new_game(7, difficulty=1)
+        engine.s.ingredients.clear()
+        for _ in range(15):
+            engine.add_ingredient("water", emit=False)
+        policy = HeuristicV2Strategy()
+        self.assertIsNone(
+            policy.choose(engine, PendingChoice(kind="ingredient", offers=["vein"]))
+        )
+
     def test_heuristic_v2_batch_is_seed_reproducible(self) -> None:
         first = run_batch(games=6, seed=2468, difficulty=1, strategy=HeuristicV2Strategy())
         second = run_batch(games=6, seed=2468, difficulty=1, strategy=HeuristicV2Strategy())
@@ -113,8 +124,45 @@ class SimulationTests(unittest.TestCase):
         report = run_batch(games=4, seed=12, difficulty=1)
         self.assertIn("pool_origin_counts", report.summary)
         self.assertIn("pool_event_counts", report.summary)
+        self.assertIn("pool_growth_source_counts", report.summary)
+        self.assertEqual(
+            {
+                "active_choice",
+                "automatic_generation",
+                "copy",
+                "item_generation",
+                "periodic_slag",
+                "other",
+            },
+            set(report.summary["pool_growth_source_counts"]),
+        )
         self.assertGreaterEqual(sum(report.summary["pool_origin_counts"].values()), 1)
         self.assertGreaterEqual(sum(report.summary["pool_event_counts"].values()), 1)
+
+    def test_order_progression_reports_reached_deaths_and_gold_gap(self) -> None:
+        report = run_batch(games=12, seed=77, difficulty=6)
+        rows = report.summary["order_progression"]
+        self.assertEqual(list(range(1, 13)), [row["order"] for row in rows])
+        self.assertEqual(report.summary["losses"], sum(row["died"] for row in rows))
+        for row in rows:
+            self.assertLessEqual(row["died"], row["reached"])
+            self.assertGreaterEqual(row["conditional_death_rate"], 0.0)
+            self.assertLessEqual(row["conditional_death_rate"], 1.0)
+            if row["average_gold_gap_at_death"] is not None:
+                self.assertGreaterEqual(row["average_gold_gap_at_death"], 0.0)
+
+    def test_pool_growth_source_counts_classify_copies(self) -> None:
+        def start_with_copy_potion(game: GameEngine) -> None:
+            game.s.ingredients.clear()
+            game.add_ingredient("copy_potion", emit=False)
+            game.add_ingredient("water", emit=False)
+            game.add_ingredient("water", emit=False)
+            game.s.gold = 10_000
+
+        record = simulate_game(3, difficulty=1, on_start=start_with_copy_potion, max_actions=100)
+        source_counts = record.strategy_events["pool_source_counts"]
+        self.assertGreaterEqual(source_counts.get("copy", 0), 1)
+        self.assertIn("growth_source", record.strategy_events["pool_events"][0])
 
     def test_report_includes_pool_distribution_summing_to_games(self) -> None:
         report = run_batch(games=10, seed=123, difficulty=1)
@@ -229,6 +277,33 @@ class SimulationTests(unittest.TestCase):
         record = simulate_game(42, on_start=on_start, max_actions=1000)
         self.assertEqual([(0, "ore_sorting_table")], seen)
         self.assertLessEqual(record.action_count, 1000)
+
+    def test_pool_growth_source_counts_classify_item_generated_choices(self) -> None:
+        class FirstOfferStrategy(HeuristicStrategy):
+            name = "first-offer-item-source-test"
+
+            def choose(self, engine, choice):
+                return 1 if choice.offers else None
+
+        def on_start(engine: GameEngine) -> None:
+            engine.add_item("large_reactor")
+
+        record = simulate_game(
+            4242,
+            strategy=FirstOfferStrategy(),
+            on_start=on_start,
+            max_actions=1000,
+        )
+        item_events = [
+            event
+            for event in record.strategy_events["pool_events"]
+            if event.get("growth_source") == "item_generation"
+        ]
+        self.assertGreaterEqual(len(item_events), 4)
+        self.assertGreaterEqual(
+            record.strategy_events["pool_source_counts"]["item_generation"],
+            4,
+        )
 
     def test_content_report_includes_trigger_and_consumption_telemetry(self) -> None:
         report = run_batch(games=8, seed=123, difficulty=1)

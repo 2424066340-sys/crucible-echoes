@@ -13,6 +13,8 @@ class LongRunTests(unittest.TestCase):
         while engine.s.status == "playing" and spins < 400:
             while engine.s.pending:
                 engine.choose(1)
+            if engine.s.status != "playing":
+                break
             engine.spin()
             spins += 1
         self.assertEqual("won", engine.s.status)

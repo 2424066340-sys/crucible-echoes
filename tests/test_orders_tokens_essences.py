@@ -8,6 +8,7 @@ from crucible_echoes.engine import GameEngine, GameError
 class OrdersTokensEssencesTests(unittest.TestCase):
     def test_order_curve_and_cumulative_difficulty_bonuses(self) -> None:
         engine = GameEngine(); engine.new_game(1, difficulty=10)
+        self.assertEqual((285, 7), engine.current_order_for(5, 1, {}))
         expected = {7: 375, 8: 450, 9: 600, 10: 650, 11: 700}
         for order_number, amount in expected.items():
             actual, _ = engine.current_order_for(order_number - 1, 10, {})
@@ -19,8 +20,8 @@ class OrdersTokensEssencesTests(unittest.TestCase):
         for difficulty, count in ((1,0),(5,1),(6,2),(8,3),(10,3)):
             engine = GameEngine(); engine.new_game(1, difficulty)
             self.assertEqual(count, sum(x.def_id == "slag" for x in engine.s.ingredients))
-        self.assertEqual(25, GameEngine.slag_interval(7))
-        self.assertEqual(20, GameEngine.slag_interval(8))
+        self.assertEqual(15, GameEngine.slag_interval(7))
+        self.assertEqual(15, GameEngine.slag_interval(8))
         self.assertEqual(15, GameEngine.slag_interval(10))
 
     def test_even_order_awards_tokens_with_cumulative_per_token_rules(self) -> None:

@@ -114,6 +114,8 @@ def render(engine: GameEngine, *, inventory: bool = False) -> str:
     payload = engine.status_payload()
     lines: list[str] = []
     amount = payload["order_amount"]
+    if payload.get("endless_mode"):
+        lines.append(f"无限模式：第{payload['endless_order']}份无限订单 / 目标{payload['endless_target']}g / 剩余{payload['spins_left']}回合")
     lines.append(f"状态：{payload['status']}  金币：{payload['gold']}g  难度：{payload['difficulty']}")
     lines.append(f"订单：第{payload['order']}份 / {amount}g  剩余旋转：{payload['spins_left']}")
     lines.append(f"实验池：{payload['pool_size']}个成分  盘面容量：{payload['board_capacity']}格  seed：{payload['seed']}")
@@ -126,10 +128,15 @@ def render(engine: GameEngine, *, inventory: bool = False) -> str:
         lines.extend("  " + row for row in state.last_log)
     if state.pending:
         choice = state.pending[0]
-        collection = engine.catalog.ingredients if choice.kind == "ingredient" else engine.catalog.items if choice.kind == "item" else engine.catalog.essences
+        collection = (
+            engine.catalog.ingredients if choice.kind == "ingredient"
+            else engine.catalog.items if choice.kind == "item"
+            else engine.catalog.essences if choice.kind == "essence"
+            else {}
+        )
         lines.append(f"待选 {choice.kind}（来源：{choice.source}）：")
         for index, def_id in enumerate(choice.offers, 1):
-            row = collection[def_id]
+            row = engine._definition_view(choice.kind, def_id) if choice.kind == "run_end" else collection[def_id]
             rarity = f"{row.get('rarity')}级 " if row.get("rarity") else ""
             lines.append(f"  {index}. {row['name']} [{def_id}] — {rarity}{row.get('description','')}")
         lines.append("  可用：choose N" + (" / skip" if choice.can_skip else ""))
