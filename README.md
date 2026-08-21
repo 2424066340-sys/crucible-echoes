@@ -55,7 +55,7 @@ py -3 game.py agent status --save .saves/agent.json
 py -3 game.py simulate --games 1000 --seed 42 --difficulty 1
 ```
 
-可切换 `heuristic-v1` / `heuristic-v2`，并用 `--summary-only` 进行大规模扫描：
+可切换 `heuristic-v1` / `heuristic-v2` / `heuristic-v3` / `heuristic-v3.1`，并用 `--summary-only` 进行大规模扫描。v3 和 v3.1 是控池策略，v2 保持为 A/B 基线；v3.1 在18张前基本沿用v2，并对生成型成分使用分级惩罚：
 
 ```powershell
 py -3 game.py simulate `

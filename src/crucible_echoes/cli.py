@@ -13,6 +13,20 @@ from .simulation import run_batch, run_difficulty_sweep, strategy_from_name, wri
 
 DEFAULT_SAVE = Path(".saves/current.json")
 
+
+def _safe_stdout(text: str, end: str = "") -> None:
+    """Print report text even when a Windows console uses a narrow code page."""
+    payload = text + end
+    try:
+        sys.stdout.write(payload)
+    except UnicodeEncodeError:
+        buffer = getattr(sys.stdout, "buffer", None)
+        if buffer is not None:
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+            buffer.write(payload.encode(encoding, errors="replace"))
+        else:
+            sys.stdout.write(payload.encode("ascii", errors="replace").decode("ascii"))
+
 COMMAND_HELP = """可用命令：
   new --seed N --difficulty 1..10   新开一局
   start                              进入交互模式（自动读取存档）
@@ -24,7 +38,7 @@ COMMAND_HELP = """可用命令：
   remove N                           消耗1个删除Token移除库存第N个成分
   inventory                          查看成分、道具、精粹和Token
   use ITEM_ID                        使用主动道具
-  simulate --games N                 批量模拟并生成平衡报告（可选--strategy heuristic-v1/v2）
+  simulate --games N                 批量模拟并生成平衡报告（可选--strategy heuristic-v1/v2/v3/v3.1）
   help                               显示本帮助
   quit                               退出交互模式
 """
@@ -61,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     simulate.add_argument("--games", type=int, default=1000, help="模拟局数，默认1000")
     simulate.add_argument("--seed", type=int, default=1, help="批量基础seed")
     simulate.add_argument("--difficulty", type=int, default=1)
-    simulate.add_argument("--strategy", choices=("heuristic-v1", "heuristic-v2"), default="heuristic-v1")
+    simulate.add_argument("--strategy", choices=("heuristic-v1", "heuristic-v2", "heuristic-v3", "heuristic-v3.1"), default="heuristic-v1")
     simulate.add_argument("--max-actions", type=int, default=5000, help="单局动作上限")
     simulate.add_argument("--report", default="reports/balance_report.md", help="Markdown报告路径")
     simulate.add_argument("--json-report", default="reports/balance_report.json", help="JSON明细报告路径")
@@ -71,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     sweep.add_argument("--seed", type=int, default=1, help="固定base seed")
     sweep.add_argument("--games-low", type=int, default=1000, help="难度1-5每档局数")
     sweep.add_argument("--games-high", type=int, default=500, help="难度6-10每档局数")
-    sweep.add_argument("--strategy", choices=("heuristic-v1", "heuristic-v2"), default="heuristic-v1")
+    sweep.add_argument("--strategy", choices=("heuristic-v1", "heuristic-v2", "heuristic-v3", "heuristic-v3.1"), default="heuristic-v1")
     sweep.add_argument("--max-actions", type=int, default=5000, help="单局动作上限")
     sweep.add_argument("--report", default="reports/balance_sweep.md", help="汇总Markdown报告")
     sweep.add_argument("--json-report", default="reports/balance_sweep.json", help="汇总JSON报告")
@@ -271,8 +285,8 @@ def run_simulation_command(ns: argparse.Namespace) -> int:
         retain_details=not ns.summary_only,
     )
     write_report(report, ns.report, ns.json_report)
-    print(report.to_markdown(), end="")
-    print(f"\nMarkdown报告：{ns.report}\nJSON明细：{ns.json_report}")
+    _safe_stdout(report.to_markdown())
+    _safe_stdout(f"\nMarkdown报告：{ns.report}\nJSON明细：{ns.json_report}\n")
     return 0
 
 
@@ -293,8 +307,8 @@ def run_simulation_sweep_command(ns: argparse.Namespace) -> int:
         retain_details=not ns.summary_only,
     )
     write_sweep_report(report, ns.report, ns.json_report, ns.detail_directory)
-    print(report.to_markdown(), end="")
-    print(f"\n汇总Markdown报告：{ns.report}\n汇总JSON报告：{ns.json_report}\n明细目录：{ns.detail_directory}")
+    _safe_stdout(report.to_markdown())
+    _safe_stdout(f"\n汇总Markdown报告：{ns.report}\n汇总JSON报告：{ns.json_report}\n明细目录：{ns.detail_directory}\n")
     return 0
 
 

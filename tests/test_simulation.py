@@ -13,6 +13,8 @@ from crucible_echoes.model import PendingChoice
 from crucible_echoes.simulation import (
     HeuristicStrategy,
     HeuristicV2Strategy,
+    HeuristicV3Strategy,
+    HeuristicV31Strategy,
     run_batch,
     run_difficulty_sweep,
     simulate_game,
@@ -81,6 +83,157 @@ class SimulationTests(unittest.TestCase):
         self.assertEqual(first.to_dict(), second.to_dict())
         self.assertEqual("heuristic-v2", first.strategy)
 
+    def test_heuristic_v3_batch_is_seed_reproducible(self) -> None:
+        first = run_batch(games=6, seed=2468, difficulty=1, strategy=HeuristicV3Strategy())
+        second = run_batch(games=6, seed=2468, difficulty=1, strategy=HeuristicV3Strategy())
+        self.assertEqual(first.to_dict(), second.to_dict())
+        self.assertEqual("heuristic-v3", first.strategy)
+
+    def test_heuristic_v31_is_registered_and_matches_v2_below_eighteen(self) -> None:
+        engine = GameEngine()
+        engine.new_game(2480, difficulty=1)
+        engine.s.ingredients.clear()
+        for _ in range(17):
+            engine.add_ingredient("water", emit=False)
+        v2 = HeuristicV2Strategy()
+        v31 = HeuristicV31Strategy()
+        for def_id in ("water", "vein", "alchemist"):
+            choice = PendingChoice(kind="ingredient", offers=[def_id])
+            self.assertEqual(v2.choose(engine, choice), v31.choose(engine, choice))
+        self.assertEqual("heuristic-v3.1", strategy_from_name("heuristic-v3.1").name)
+
+    def test_heuristic_v31_has_graduated_pool_bands(self) -> None:
+        engine = GameEngine()
+        engine.new_game(2481, difficulty=1)
+        v2 = HeuristicV2Strategy()
+        v3 = HeuristicV3Strategy()
+        v31 = HeuristicV31Strategy()
+        for pool_size in (18, 19):
+            engine.s.ingredients.clear()
+            for _ in range(pool_size):
+                engine.add_ingredient("water", emit=False)
+            choice = PendingChoice(kind="ingredient", offers=["water"])
+            self.assertEqual(1, v2.choose(engine, choice))
+            self.assertEqual(1, v31.choose(engine, choice))
+            self.assertGreater(v31.score(engine, "ingredient", "water"), v3.score(engine, "ingredient", "water"))
+        for pool_size in (20, 24, 25):
+            engine.s.ingredients.clear()
+            for _ in range(pool_size):
+                engine.add_ingredient("water", emit=False)
+            self.assertIsNone(v31.choose(engine, PendingChoice(kind="ingredient", offers=["water"])))
+
+    def test_heuristic_v31_graduates_generator_penalties_without_forbidding_generators(self) -> None:
+        engine = GameEngine()
+        engine.new_game(2482, difficulty=1)
+        policy = HeuristicV31Strategy()
+        continuous = policy._generator_class_and_weight(
+            engine, engine.catalog.ingredients["summoner"]
+        )
+        periodic = policy._generator_class_and_weight(
+            engine, engine.catalog.ingredients["alchemist"]
+        )
+        recursive_periodic = policy._generator_class_and_weight(
+            engine, engine.catalog.ingredients["vein"]
+        )
+        one_time = policy._generator_class_and_weight(
+            engine, {"one_time_spawn": {"id": "water", "amount": 1}}
+        )
+        self.assertGreater(continuous[1], periodic[1])
+        self.assertGreater(recursive_periodic[1], periodic[1])
+        self.assertGreater(periodic[1], one_time[1])
+
+        engine.s.ingredients.clear()
+        for _ in range(25):
+            engine.add_ingredient("water", emit=False)
+        # A low-frequency generator remains selectable when its expected
+        # value is good enough; there is no unconditional "forbidden" gate.
+        self.assertEqual(
+            1,
+            policy.choose(engine, PendingChoice(kind="ingredient", offers=["alchemist"])),
+        )
+
+    def test_heuristic_v31_preserves_a_generator_core_exception(self) -> None:
+        engine = GameEngine()
+        engine.new_game(2483, difficulty=1)
+        engine.s.ingredients.clear()
+        engine.add_ingredient("growth_magic", emit=False)
+        engine.add_ingredient("growth_magic", emit=False)
+        for _ in range(18):
+            engine.add_ingredient("water", emit=False)
+        policy = HeuristicV31Strategy()
+        self.assertEqual(
+            1,
+            policy.choose(engine, PendingChoice(kind="ingredient", offers=["magic_magic"])),
+        )
+
+    def test_heuristic_v3_is_registered_and_matches_v2_below_fifteen(self) -> None:
+        engine = GameEngine()
+        engine.new_game(2468, difficulty=1)
+        engine.s.ingredients.clear()
+        for _ in range(10):
+            engine.add_ingredient("water", emit=False)
+        v2 = HeuristicV2Strategy()
+        v3 = HeuristicV3Strategy()
+        for def_id in ("water", "vein", "alchemist"):
+            choice = PendingChoice(kind="ingredient", offers=[def_id])
+            self.assertEqual(v2.choose(engine, choice), v3.choose(engine, choice))
+        self.assertEqual("heuristic-v3", strategy_from_name("heuristic-v3").name)
+
+    def test_heuristic_v3_increases_skips_at_fifteen_and_twenty(self) -> None:
+        engine = GameEngine()
+        engine.new_game(2469, difficulty=1)
+        engine.s.ingredients.clear()
+        v2 = HeuristicV2Strategy()
+        v3 = HeuristicV3Strategy()
+        for pool_size in (15, 20):
+            engine.s.ingredients.clear()
+            for _ in range(pool_size):
+                engine.add_ingredient("water", emit=False)
+            choice = PendingChoice(kind="ingredient", offers=["water"])
+            self.assertEqual(1, v2.choose(engine, choice))
+            self.assertIsNone(v3.choose(engine, choice))
+
+    def test_heuristic_v3_rejects_unhandled_generators_but_keeps_sinks_and_core(self) -> None:
+        engine = GameEngine()
+        engine.new_game(2470, difficulty=1)
+        engine.s.ingredients.clear()
+        for _ in range(20):
+            engine.add_ingredient("water", emit=False)
+        policy = HeuristicV3Strategy()
+        self.assertIsNone(
+            policy.choose(engine, PendingChoice(kind="ingredient", offers=["summoner"]))
+        )
+        self.assertEqual(
+            1,
+            policy.choose(engine, PendingChoice(kind="ingredient", offers=["alchemist"])),
+        )
+
+        engine.s.ingredients.clear()
+        engine.add_ingredient("growth_magic", emit=False)
+        engine.add_ingredient("growth_magic", emit=False)
+        for _ in range(18):
+            engine.add_ingredient("water", emit=False)
+        self.assertEqual(
+            1,
+            policy.choose(engine, PendingChoice(kind="ingredient", offers=["magic_magic"])),
+        )
+
+    def test_heuristic_v3_prefers_cleanup_and_exposes_pool_band_telemetry(self) -> None:
+        engine = GameEngine()
+        engine.new_game(2471, difficulty=1)
+        engine.s.ingredients.clear()
+        for _ in range(20):
+            engine.add_ingredient("water", emit=False)
+        engine.s.tokens["remove"] = 1
+        policy = HeuristicV3Strategy()
+        self.assertIsNotNone(policy.removal_index(engine))
+
+        report = run_batch(games=4, seed=2471, difficulty=1, strategy=policy)
+        self.assertIn("pool_band_choice_stats", report.summary)
+        self.assertIn("15_19", report.summary["pool_band_choice_stats"])
+        self.assertIn("generator_choice_stats", report.summary)
+        self.assertTrue(all(value >= 0 for value in report.summary["pool_growth_source_counts"].values()))
+
     def test_pool_cost_uses_provenance_and_releases(self) -> None:
         engine = GameEngine()
         engine.new_game(7, difficulty=1)
@@ -125,6 +278,9 @@ class SimulationTests(unittest.TestCase):
         self.assertIn("pool_origin_counts", report.summary)
         self.assertIn("pool_event_counts", report.summary)
         self.assertIn("pool_growth_source_counts", report.summary)
+        self.assertIn("pool_over_30_rate", report.summary)
+        self.assertIn("active_choice_total", report.summary)
+        self.assertIn("automatic_generation_total", report.summary)
         self.assertEqual(
             {
                 "active_choice",
@@ -254,6 +410,43 @@ class SimulationTests(unittest.TestCase):
             self.assertEqual(0, code)
             data = json.loads((root / "v2.json").read_text(encoding="utf-8"))
             self.assertEqual("heuristic-v2", data["config"]["strategy"])
+            self.assertEqual([], data["games"])
+
+    def test_simulate_cli_accepts_heuristic_v3(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = main([
+                    "simulate",
+                    "--games", "1",
+                    "--seed", "7",
+                    "--strategy", "heuristic-v3",
+                    "--summary-only",
+                    "--report", str(root / "v3.md"),
+                    "--json-report", str(root / "v3.json"),
+                ])
+            self.assertEqual(0, code)
+            data = json.loads((root / "v3.json").read_text(encoding="utf-8"))
+            self.assertEqual("heuristic-v3", data["config"]["strategy"])
+            self.assertIn("pool_band_choice_stats", data["summary"])
+            self.assertEqual([], data["games"])
+
+    def test_simulate_cli_accepts_heuristic_v31(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = main([
+                    "simulate",
+                    "--games", "1",
+                    "--seed", "7",
+                    "--strategy", "heuristic-v3.1",
+                    "--summary-only",
+                    "--report", str(root / "v31.md"),
+                    "--json-report", str(root / "v31.json"),
+                ])
+            self.assertEqual(0, code)
+            data = json.loads((root / "v31.json").read_text(encoding="utf-8"))
+            self.assertEqual("heuristic-v3.1", data["config"]["strategy"])
             self.assertEqual([], data["games"])
 
     def test_single_game_can_use_replacement_strategy(self) -> None:
