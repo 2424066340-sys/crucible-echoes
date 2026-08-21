@@ -48,6 +48,9 @@ class GameEngine:
         if not 1 <= difficulty <= 10:
             raise GameError("难度必须在1到10之间")
         self.rng = DeterministicRNG(seed & ((1 << 64) - 1))
+        self._round_events = defaultdict(int)
+        self._round_event_values = defaultdict(int)
+        self._removed_values = []
         first = self.current_order_for(0, difficulty, {})
         state = GameState(
             version=1,
@@ -63,6 +66,7 @@ class GameEngine:
             stats={
                 "event_counts": {},
                 "event_values": {},
+                "round_events": {},
                 "essence_baseline": {},
                 "essence_hits": {},
                 "seen_types": [],
@@ -101,6 +105,7 @@ class GameEngine:
         self.s.stats.setdefault("spawn_counters", {})
         self.s.stats.setdefault("event_counts", {})
         self.s.stats.setdefault("event_values", {})
+        self.s.stats.setdefault("round_events", {})
         self.s.stats.setdefault("essence_baseline", {})
         self.s.stats.setdefault("essence_hits", {})
         self.s.stats.setdefault("seen_types", [])
@@ -115,6 +120,13 @@ class GameEngine:
         self.s.flags.setdefault("choice_minimum_rarity", 0)
         self.s.flags.setdefault("choice_minimum_reserved", 0)
         self.rng = DeterministicRNG(state.rng_state)
+        # Round counters are persisted because the agent interface executes
+        # one action per process. Without restoring them, two rerolls issued
+        # in separate processes would look like two unrelated first rerolls.
+        self._round_events = defaultdict(int, {
+            str(key): int(value)
+            for key, value in self.s.stats.get("round_events", {}).items()
+        })
         return self
 
     @property
@@ -131,6 +143,7 @@ class GameEngine:
 
     def _sync_rng(self) -> None:
         self.s.rng_state = self.r.state
+        self.s.stats["round_events"] = dict(self._round_events)
 
     @staticmethod
     def initial_slag_count(difficulty: int) -> int:
@@ -455,7 +468,15 @@ class GameEngine:
         self.s.essences.append(essence_id)
         counts = dict(self.s.stats.setdefault("event_counts", {}))
         values = dict(self.s.stats.setdefault("event_values", {}))
-        self.s.stats.setdefault("essence_baseline", {})[essence_id] = {"events": counts, "values": values, "spin": self.s.spin}
+        # Round-scoped triggers must not count events that happened before the
+        # essence was acquired. Persist this snapshot so the stateless agent
+        # interface remains correct when a save is reloaded between actions.
+        self.s.stats.setdefault("essence_baseline", {})[essence_id] = {
+            "events": counts,
+            "values": values,
+            "round_events": dict(self._round_events),
+            "spin": self.s.spin,
+        }
         self.s.last_log.append(f"获得精粹：{self.catalog.essences[essence_id]['name']}。")
 
     def emit(self, event: str, amount: int = 1, value: int = 0) -> None:
@@ -755,6 +776,7 @@ class GameEngine:
         endless_at_spin_start = bool(self.s.endless_mode)
         self._round_events = defaultdict(int)
         self._round_event_values = defaultdict(int)
+        self.s.stats["round_events"] = {}
         self._removed_values = []
         self.s.spin += 1
         self.s.spins_left -= 1
@@ -843,7 +865,18 @@ class GameEngine:
             )
         self.s.last_log.insert(0, f"第{self.s.spin}回合：成分与道具合计 {income:+d}g。")
         self.s.last_board = [
-            {"slot": i + 1, "coord": list(self._coords[i]), "uid": inst.uid, "id": inst.def_id, "name": self.catalog.ingredients[inst.def_id]["name"], "value": self._values[i]}
+            {
+                "slot": i + 1,
+                "coord": list(self._coords[i]),
+                "uid": inst.uid,
+                "id": inst.def_id,
+                "name": self.catalog.ingredients[inst.def_id]["name"],
+                "value": self._values[i],
+                # Keep removed board instances observable without making them
+                # look like active ingredients. Essence board predicates use
+                # the same presence rule.
+                "present": self._present(inst),
+            }
             for i, inst in enumerate(self._board)
         ]
         self._decay_flags()
@@ -1697,6 +1730,7 @@ class GameEngine:
             self.s.stats.setdefault("essence_baseline", {})[essence_id] = {
                 "events": dict(self.s.stats.setdefault("event_counts", {})),
                 "values": dict(self.s.stats.setdefault("event_values", {})),
+                "round_events": dict(self._round_events),
                 "spin": self.s.spin,
             }
             self.s.stats[f"essence_last_trigger:{essence_id}"] = self.s.spin
@@ -1758,7 +1792,14 @@ class GameEngine:
             if int(totals.get(event,0))-int(baseline.get("events",{}).get(event,0)) < int(spec["count"]): return False
         if "event_count_round" in trigger:
             spec=trigger["event_count_round"]
-            if self._round_events.get(spec["event"],0) < int(spec["count"]): return False
+            # A newly acquired essence starts counting from the current
+            # in-round event total. At the next spin the counter resets, so a
+            # snapshot from an earlier round must not carry over.
+            round_baseline = baseline.get("round_events", {})
+            if int(baseline.get("spin", self.s.spin)) != self.s.spin:
+                round_baseline = {}
+            current = self._round_events.get(spec["event"], 0) - int(round_baseline.get(spec["event"], 0))
+            if current < int(spec["count"]): return False
         if "event_value" in trigger:
             spec=trigger["event_value"]; event=spec["event"]
             if int(values.get(event,0))-int(baseline.get("values",{}).get(event,0)) < int(spec["value"]): return False

@@ -18,9 +18,14 @@ The JSON envelope contains:
 - `pending_choices`: the complete reward queue, including offer definitions;
 - tagged reward queues expose `tag_filter`, so an agent can see that roster
   choices are restricted before selecting or rerolling;
-- `last_board` and `last_log`: the most recent observable result;
+- `last_board` and `last_log`: the most recent observable result. Each
+  `last_board` row includes `present`; a `false` row was on the sampled board
+  but was removed during that spin and no longer participates in board-based
+  triggers;
 - `stats.spawn_counters`: persisted success counters such as the summon-magic
   guarantee counter (old saves receive an empty object automatically);
+- `state.stats.round_events`: persisted counts for the current round, so
+  round-scoped essence triggers continue across stateless agent actions;
 - `state.stats.item_storage`: persisted balances such as the piggy-bank reserve
   (old saves receive an empty object automatically);
 - `available_actions`: executable command strings for the next step;

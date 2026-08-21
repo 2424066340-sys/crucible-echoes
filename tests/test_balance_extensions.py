@@ -4,7 +4,7 @@ from collections import defaultdict
 import unittest
 
 from crucible_echoes.engine import GameEngine
-from crucible_echoes.model import GameState
+from crucible_echoes.model import GameState, PendingChoice
 
 
 class BalanceExtensionTests(unittest.TestCase):
@@ -383,13 +383,57 @@ class BalanceExtensionTests(unittest.TestCase):
         self.assertEqual(1, engine.s.tokens["remove"])
         self.assertIn("monster_guide_essence", engine.s.consumed_essences)
 
+    def test_cyan_reagent_essence_requires_all_present_board_instances_unique(self) -> None:
+        engine = self.fresh()
+        first = engine.add_ingredient("snake", emit=False)
+        second = engine.add_ingredient("snake", emit=False)
+        engine.add_essence("cyan_reagent_essence")
+        engine._board = [first, second]
+        engine._coords = [(0, 0), (0, 1)]
+        engine._values = [0, 0]
+
+        engine.check_essences()
+        self.assertEqual(0, engine.s.gold)
+        self.assertIn("cyan_reagent_essence", engine.s.essences)
+
+        # If one duplicate has already left the pool, the remaining visible
+        # board is unique and the essence is allowed to trigger.
+        engine.s.ingredients.remove(second)
+        engine.check_essences()
+        self.assertEqual(40, engine.s.gold)
+        self.assertIn("cyan_reagent_essence", engine.s.consumed_essences)
+
+    def test_auto_reroller_essence_starts_counting_when_acquired(self) -> None:
+        engine = self.fresh()
+        engine.s.pending = [PendingChoice(kind="ingredient", offers=["water"])]
+        engine.s.tokens["roll"] = 2
+        engine.reroll()
+        engine.reroll()
+
+        # Rerolls before acquisition must not satisfy the new essence.
+        engine.add_essence("auto_reroller_essence")
+        engine.check_essences()
+        self.assertIn("auto_reroller_essence", engine.s.essences)
+
+        engine.s.tokens["roll"] = 2
+        engine.reroll()
+        self.assertIn("auto_reroller_essence", engine.s.essences)
+
+        # The second action may run in a fresh stateless agent process.
+        engine = GameEngine().bind(GameState.from_dict(engine.s.to_dict()))
+        engine.reroll()
+        self.assertEqual(5, engine.s.tokens["roll"])
+        self.assertIn("auto_reroller_essence", engine.s.consumed_essences)
+
     def test_new_counter_state_has_safe_default_for_old_save(self) -> None:
         engine = self.fresh()
         old_data = engine.s.to_dict()
         old_data["stats"].pop("spawn_counters", None)
+        old_data["stats"].pop("round_events", None)
         old_data.pop("flags", None)
         resumed = GameEngine().bind(GameState.from_dict(old_data))
         self.assertEqual({}, resumed.s.stats["spawn_counters"])
+        self.assertEqual({}, resumed.s.stats["round_events"])
         self.assertEqual(0, resumed.s.flags["choice_minimum_count"])
 
     def test_agent_payload_exposes_new_owned_definitions_and_counters(self) -> None:

@@ -135,7 +135,10 @@ def render(engine: GameEngine, *, inventory: bool = False) -> str:
     lines.append(f"实验池：{payload['pool_size']}个成分  盘面容量：{payload['board_capacity']}格  seed：{payload['seed']}")
     lines.append(f"Token：Roll {state.tokens.get('roll',0)} / 删除 {state.tokens.get('remove',0)} / 精粹 {state.tokens.get('essence',0)}")
     if state.last_board:
-        board = "  ".join(f"{row['slot']}:{row['name']}({row['value']:+d}g)" for row in state.last_board)
+        board = "  ".join(
+            f"{row['slot']}:{row['name']}{'' if row.get('present', True) else '[gone]'}({row['value']:+d}g)"
+            for row in state.last_board
+        )
         lines.append("最近盘面：" + board)
     if state.last_log:
         lines.append("最近记录：")

@@ -74,6 +74,7 @@ class GameState:
         copied["pending"] = [PendingChoice.from_dict(x) for x in copied.get("pending", [])]
         stats = dict(copied.get("stats") or {})
         stats.setdefault("spawn_counters", {})
+        stats.setdefault("round_events", {})
         stats.setdefault("item_event_counts", {})
         stats.setdefault("item_trigger_counts", {})
         stats.setdefault("item_storage", {})
